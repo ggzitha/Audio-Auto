@@ -90,7 +90,7 @@ document.addEventListener('DOMContentLoaded', () => {
             formData.append(key, value);
         }
         
-        fetch(/api/, { method: 'POST', body: formData }).catch(e => console.error(e));
+        fetch(`/api/${action}`, { method: 'POST', body: formData }).catch(e => console.error(e));
     }
     
     function updateUIFromState() {
@@ -163,7 +163,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let ws = null;
     function connectWebSocket() {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        ws = new WebSocket(${protocol}///ws);
+        ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
         
         ws.onmessage = function(event) {
             try {
@@ -319,24 +319,24 @@ document.addEventListener('DOMContentLoaded', () => {
                 playlistContainer.innerHTML = '<div class="p-8 text-center text-gray-500">No audio files.</div>';
                 return;
             }
-            playlistContainer.innerHTML = files.map(f => 
-                <div class="flex items-center justify-between px-6 py-4 hover:bg-gray-50 dark:hover:bg-[#253246] transition-colors group cursor-pointer" data-id="">
-                    <div class="flex items-center space-x-4" onclick="window.selectSong()">
+            playlistContainer.innerHTML = files.map(f => `
+                <div class="flex items-center justify-between px-6 py-4 hover:bg-gray-50 dark:hover:bg-[#253246] transition-colors group cursor-pointer" data-id="${f.id}">
+                    <div class="flex items-center space-x-4" onclick='window.selectSong(${JSON.stringify(f).replace(/'/g, "\\'")})'>
                         <div class="h-10 w-10 rounded-full bg-blue-100 dark:bg-blue-900/30 flex items-center justify-center text-primary group-hover:scale-110 transition-transform">
                             <i class="fas fa-music"></i>
                         </div>
                         <div>
-                            <h4 class="font-semibold text-gray-800 dark:text-gray-200"></h4>
-                            <p class="text-xs text-gray-500 mt-1"></p>
+                            <h4 class="font-semibold text-gray-800 dark:text-gray-200">${f.original_name}</h4>
+                            <p class="text-xs text-gray-500 mt-1">${formatTime(f.duration)}</p>
                         </div>
                     </div>
                     <div class="flex items-center space-x-3">
-                        <button onclick="window.deleteFile()" class="text-red-400 hover:text-red-600 p-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <button onclick="window.deleteFile(${f.id})" class="text-red-400 hover:text-red-600 p-2 opacity-0 group-hover:opacity-100 transition-opacity">
                             <i class="fas fa-trash"></i>
                         </button>
                     </div>
                 </div>
-            ).join('');
+            `).join('');
             
             updateUIFromState(); // to highlight correct song
         }
@@ -426,23 +426,23 @@ document.addEventListener('DOMContentLoaded', () => {
                         card.className = 'glass rounded-2xl p-6 shadow-lg flex flex-col h-96';
                         grid.appendChild(card);
                     }
-                    card.innerHTML = 
+                    card.innerHTML = `
                         <div class="flex justify-between items-start mb-2 shrink-0">
-                            <h3 class="text-lg font-bold flex items-center"><i class="fas fa-microchip text-primary mr-2"></i> </h3>
-                            <span class="flex items-center text-xs px-2 py-1 rounded-full ">
-                                
+                            <h3 class="text-lg font-bold flex items-center"><i class="fas fa-microchip text-primary mr-2"></i> ${d.name}</h3>
+                            <span class="flex items-center text-xs px-2 py-1 rounded-full ${isOnline ? 'bg-green-900/30 text-green-400' : 'bg-red-900/30 text-red-400'}">
+                                ${d.status.toUpperCase()}
                             </span>
                         </div>
                         <div class="text-xs text-gray-400 mb-2 space-y-1">
-                            <div><i class="fas fa-network-wired w-4"></i> IP: </div>
-                            <div><i class="fas fa-wifi w-4"></i> Signal: </div>
-                            <div><i class="fas fa-thermometer-half w-4"></i> Temp: </div>
+                            <div><i class="fas fa-network-wired w-4"></i> IP: ${d.ip_address || 'N/A'}</div>
+                            <div><i class="fas fa-wifi w-4"></i> Signal: ${d.rssi ? d.rssi + ' dBm' : 'N/A'}</div>
+                            <div><i class="fas fa-thermometer-half w-4"></i> Temp: ${d.temperature ? d.temperature + '°C' : 'N/A'}</div>
                         </div>
                         <div class="flex-grow flex flex-col min-h-0 bg-black/50 rounded-lg p-2 font-mono text-xs overflow-hidden mt-2">
                             <div class="text-gray-500 mb-1 border-b border-gray-700 pb-1">--- Terminal Logs ---</div>
-                            <div id="log-" class="flex-grow overflow-y-auto text-green-400 break-all space-y-1 pr-1 custom-scrollbar"></div>
+                            <div id="log-${d.name}" class="flex-grow overflow-y-auto text-green-400 break-all space-y-1 pr-1 custom-scrollbar"></div>
                         </div>
-                    ;
+                    `;
                 });
             });
         }
@@ -458,7 +458,7 @@ document.addEventListener('DOMContentLoaded', () => {
         fetch('/api/files').then(r=>r.json()).then(files => {
             const select = document.getElementById('audioSelect');
             if(select) {
-                select.innerHTML = files.map(f => <option value=""></option>).join('');
+                select.innerHTML = files.map(f => `<option value="${f.id}">${f.original_name}</option>`).join('');
             }
         });
         
@@ -466,7 +466,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const select = document.getElementById('targetDeviceSelect');
             if(select) {
                 let html = '<option value="all">All Devices</option>';
-                devices.forEach(d => { html += <option value=""></option>; });
+                devices.forEach(d => { html += `<option value="${d.name}">${d.name}</option>`; });
                 select.innerHTML = html;
             }
         });
@@ -516,19 +516,19 @@ document.addEventListener('DOMContentLoaded', () => {
                     tbody.innerHTML = '<tr><td colspan="5" class="py-4 text-center text-gray-500">No active schedules</td></tr>';
                     return;
                 }
-                tbody.innerHTML = schedules.map(s => 
+                tbody.innerHTML = schedules.map(s => `
                     <tr class="border-b dark:border-gray-700/50">
-                        <td class="py-3 px-4 font-mono text-primary"></td>
-                        <td class="py-3 px-4 capitalize"></td>
-                        <td class="py-3 px-4 text-gray-400">ID: </td>
-                        <td class="py-3 px-4"></td>
+                        <td class="py-3 px-4 font-mono text-primary">${s.scheduled_time}</td>
+                        <td class="py-3 px-4 capitalize">${s.repeat}</td>
+                        <td class="py-3 px-4 text-gray-400">ID: ${s.audio_id}</td>
+                        <td class="py-3 px-4">${s.device_name}</td>
                         <td class="py-3 px-4 text-right">
-                            <button onclick="window.deleteSchedule()" class="text-red-400 hover:text-red-600 transition-colors">
+                            <button onclick="window.deleteSchedule(${s.id})" class="text-red-400 hover:text-red-600 transition-colors">
                                 <i class="fas fa-times"></i>
                             </button>
                         </td>
                     </tr>
-                ).join('');
+                `).join('');
             });
         }
         
