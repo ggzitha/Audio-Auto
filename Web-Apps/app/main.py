@@ -180,14 +180,9 @@ def startup_event():
         db.commit()
 
     def handle_mqtt_log(dev_name, log_text):
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(manager.broadcast({"type": "log", "device": dev_name, "text": log_text}))
-            else:
-                asyncio.run(manager.broadcast({"type": "log", "device": dev_name, "text": log_text}))
-        except RuntimeError:
-            asyncio.run(manager.broadcast({"type": "log", "device": dev_name, "text": log_text}))
+        global main_loop
+        if main_loop and main_loop.is_running():
+            asyncio.run_coroutine_threadsafe(manager.broadcast({"type": "log", "device": dev_name, "text": log_text}), main_loop)
     
     mqtt_handler.on_log_callback = handle_mqtt_log
     mqtt_handler.start_mqtt()
