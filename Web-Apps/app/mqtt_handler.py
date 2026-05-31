@@ -10,15 +10,28 @@ MQTT_PORT = int(os.environ.get("MQTT_PORT", 1883))
 MQTT_USER = os.environ.get("MQTT_USER", "inskal")
 MQTT_PASS = os.environ.get("MQTT_PASS", "admin_inskal_mqtt")
 
-client = mqtt.Client(client_id="fastapi_backend")
+# In paho-mqtt 2.0.0, callback_api_version is required
+client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id="fastapi_backend")
+on_log_callback = None
 
 def on_connect(client, userdata, flags, rc):
     print(f"Connected to MQTT broker with result code {rc}")
     client.subscribe("audioauto/telemetry/#")
+    client.subscribe("audioauto/log/#")
 
 def on_message(client, userdata, msg):
     try:
         topic = msg.topic
+        
+        if topic.startswith("audioauto/log/"):
+            parts = topic.split("/")
+            if len(parts) >= 3:
+                device_name = parts[2]
+                payload_str = msg.payload.decode()
+                if on_log_callback:
+                    on_log_callback(device_name, payload_str)
+            return
+
         payload = json.loads(msg.payload.decode())
         
         # Topic format: audioauto/telemetry/{device_name}

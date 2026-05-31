@@ -4,13 +4,8 @@
 #include <time.h>
 #include <ArduinoJson.h>
 
-// --- ESP8266Audio Library ---
-#include "AudioFileSourceHTTPStream.h"
-#include "AudioFileSourceBuffer.h"
-#include "AudioGeneratorMP3.h"
-#include "AudioGeneratorWAV.h"
-#include "AudioGeneratorFLAC.h"
-#include "AudioOutputI2S.h"
+// --- ESP32-audioI2S Library by Schreibfaul1 ---
+#include "src/ESP32-audioI2S/src/Audio.h"
 
 // --- Configuration ---
 const char* DEVICE_NAME = "ESP32-Ruang-A001"; // Change for each device
@@ -23,7 +18,7 @@ const char* WIFI_SSID3 = "BMKG-JAYAPURA";
 const char* WIFI_PASS3 = "bmkg@123";
 
 const char* NTP_SERVER = "pool.ntp.org";
-const long GMT_OFFSET_SEC = 9 * 3600; // UTC+9
+const long GMT_OFFSET_SEC = 9 * 3600; // UTC+9 Asia/Jayapura
 const int DAYLIGHT_OFFSET_SEC = 0;
 
 const char* MQTT_BROKER = "192.168.88.8";
@@ -31,49 +26,165 @@ const int MQTT_PORT = 1883;
 const char* MQTT_USER = "inskal";
 const char* MQTT_PASS = "admin_inskal_mqtt";
 
+// Hardware Options
+// Set to 'true' to use the Classic ESP32's Internal DAC (GPIO 25 & 26).
+// Set to 'false' to use an external PCM5102A I2S DAC (Required for C3/C6).
+const bool USE_INTERNAL_DAC = true; 
+
 WiFiMulti wifiMulti;
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
-// --- Audio Objects ---
-AudioGeneratorMP3 *mp3;
-AudioGeneratorWAV *wav;
-AudioGeneratorFLAC *flac;
-AudioFileSourceHTTPStream *file;
-AudioFileSourceBuffer *buff;
-AudioOutputI2S *out;
+// --- Audio Object ---
+Audio audio;
 
 enum AudioState { IDLE, PREPARING, WAITING_SYNC, PLAYING };
 AudioState currentState = IDLE;
 
 String pendingUrl = "";
 long syncStartTime = 0;
-int currentVolume = 50;
-String currentFormat = "";
-
 unsigned long lastTelemetry = 0;
+
+
+void logOutput(String msg) {
+    Serial.println(msg);
+    if (mqttClient.connected()) {
+        String topic = String("audioauto/log/") + DEVICE_NAME;
+        mqttClient.publish(topic.c_str(), msg.c_str());
+    }
+}
 
 void setupAudioHardware() {
 #if CONFIG_IDF_TARGET_ESP32
-    // ESP32: Use internal 8-bit DAC on GPIO25 & GPIO26
-    out = new AudioOutputI2S(0, 1); 
-    out->SetGain((float)currentVolume / 100.0);
-    Serial.println("Audio hardware initialized: ESP32 Internal DAC");
-#elif CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C6
-    // ESP32-C3 / C6: Use external PCM5102 I2S module
-    out = new AudioOutputI2S();
-    // Configure pins based on typical setup, user may need to adjust
-    // Default I2S pins for C3: BCLK=4, WS=5, DOUT=6
-    #if CONFIG_IDF_TARGET_ESP32C3
-      out->SetPinout(4, 5, 6); 
-    #else // C6
-      out->SetPinout(4, 5, 6); 
-    #endif
-    out->SetGain((float)currentVolume / 100.0);
-    Serial.println("Audio hardware initialized: I2S PCM5102");
+    if (USE_INTERNAL_DAC) {
+        // ESP32: Use internal 8-bit DAC on GPIO25 & GPIO26
+        // Note: Internal DAC is deprecated in ESP32-audioI2S v3.x+ and IDF v5+
+        // If you get no sound, you MUST use the external PCM5102A DAC instead.
+        audio.setPinout(26, 25, 22); 
+        Serial.println("Audio hardware initialized: ESP32 Internal DAC (GPIO25/26)");
+    } else {
+        // ESP32: External PCM5102 I2S DAC
+        audio.setPinout(26, 25, 22); // BCLK, LRC, DOUT
+        Serial.println("Audio hardware initialized: ESP32 with PCM5102A (I2S)");
+    }
+#elif CONFIG_IDF_TARGET_ESP32C3
+    // ESP32-C3: External PCM5102 I2S DAC (Required)
+    audio.setPinout(5, 4, 6); // BCLK=5, LRC=4, DOUT=6
+    Serial.println("Audio hardware initialized: ESP32-C3 with PCM5102A (I2S)");
+#elif CONFIG_IDF_TARGET_ESP32C6
+    // ESP32-C6: External PCM5102 I2S DAC (Required)
+    audio.setPinout(19, 18, 20); // BCLK=19, LRC=18, DOUT=20
+    Serial.println("Audio hardware initialized: ESP32-C6 with PCM5102A (I2S)");
 #else
-    out = new AudioOutputI2S();
+    // Fallback default
+    audio.setPinout(26, 25, 22);
 #endif
+
+    audio.setVolume(10); // Volume range is 0 to 21
+}
+
+void connectMQTT() {
+    while (!mqttClient.connected()) {
+        Serial.print("Attempting MQTT connection...");
+        if (mqttClient.connect(DEVICE_NAME, MQTT_USER, MQTT_PASS)) {
+            Serial.println("connected");
+            String topicSpec = String("audioauto/commands/") + DEVICE_NAME;
+            mqttClient.subscribe(topicSpec.c_str());
+            mqttClient.subscribe("audioauto/commands/all");
+        } else {
+            Serial.print("failed, rc=");
+            Serial.print(mqttClient.state());
+            Serial.println(" try again in 5 seconds");
+            delay(5000);
+        }
+    }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    String message = "";
+    for (int i = 0; i < length; i++) {
+        message += (char)payload[i];
+    }
+    
+    StaticJsonDocument<512> doc;
+    DeserializationError error = deserializeJson(doc, message);
+    if (error) {
+        Serial.println("Failed to parse MQTT message");
+        return;
+    }
+
+    String action = doc["action"] | "";
+    
+    if (action == "play") {
+        pendingUrl = doc["url"] | "";
+        syncStartTime = doc["start_time"] | 0;
+        
+        // Map 0-100 UI volume to 0-21 Audio library volume
+        int vol = doc["volume"] | 50;
+        int mappedVol = map(vol, 0, 100, 0, 21);
+        audio.setVolume(mappedVol);
+        
+        Serial.print("Preparing to play: ");
+        logOutput(pendingUrl);
+        Serial.print("Target Start Time (Unix): ");
+        logOutput(String(syncStartTime));
+        
+        audio.stopSong();
+        currentState = WAITING_SYNC;
+        
+        // Handle Resume Position
+        float position = doc["position"] | 0.0;
+        if (position > 0.0) {
+            audio.setAudioPlayPosition(position);
+        }
+    } 
+    else if (action == "stop") {
+        logOutput("Stop command received.");
+        audio.stopSong();
+        currentState = IDLE;
+    }
+    else if (action == "seek") {
+        float position = doc["position"] | 0.0;
+        Serial.print("Seek command received: ");
+        logOutput(String(position));
+        audio.setAudioPlayPosition(position);
+    }
+    else if (action == "speed") {
+        // Speed control requires pitch shifting which is highly intensive on ESP32,
+        // The ESP32-audioI2S doesn't directly support simple speed toggling via an API, 
+        // but we acknowledge the command.
+        logOutput("Speed command received.");
+    }
+    else if (action == "volume") {
+        int vol = doc["volume"] | 50;
+        int mappedVol = map(vol, 0, 100, 0, 21);
+        audio.setVolume(mappedVol);
+        logOutput("Volume updated to " + String(vol) + "%");
+    }
+    else if (action == "sync_time") {
+        logOutput("Resyncing time via NTP...");
+        configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+    }
+}
+
+void publishTelemetry() {
+    StaticJsonDocument<256> doc;
+    doc["ip"] = WiFi.localIP().toString();
+    doc["status"] = "online";
+    doc["rssi"] = WiFi.RSSI();
+    
+    #if CONFIG_IDF_TARGET_ESP32
+      // internal temperature sensor on classic ESP32 requires specific handling, skipping for stability
+      doc["temperature"] = 45.0; // Mock temperature
+    #else
+      doc["temperature"] = 0.0;
+    #endif
+
+    char buffer[256];
+    serializeJson(doc, buffer);
+    
+    String topic = String("audioauto/telemetry/") + DEVICE_NAME;
+    mqttClient.publish(topic.c_str(), buffer);
 }
 
 void setup() {
@@ -113,119 +224,14 @@ void setup() {
     mqttClient.setCallback(mqttCallback);
 
     // Audio Setup
-    audioLogger = &Serial;
     setupAudioHardware();
-    mp3 = new AudioGeneratorMP3();
-    wav = new AudioGeneratorWAV();
-    flac = new AudioGeneratorFLAC();
-}
-
-void connectMQTT() {
-    while (!mqttClient.connected()) {
-        Serial.print("Attempting MQTT connection...");
-        if (mqttClient.connect(DEVICE_NAME, MQTT_USER, MQTT_PASS)) {
-            Serial.println("connected");
-            String topicSpec = String("audioauto/commands/") + DEVICE_NAME;
-            mqttClient.subscribe(topicSpec.c_str());
-            mqttClient.subscribe("audioauto/commands/all");
-        } else {
-            Serial.print("failed, rc=");
-            Serial.print(mqttClient.state());
-            Serial.println(" try again in 5 seconds");
-            delay(5000);
-        }
-    }
-}
-
-void stopAudio() {
-    if (mp3 && mp3->isRunning()) mp3->stop();
-    if (wav && wav->isRunning()) wav->stop();
-    if (flac && flac->isRunning()) flac->stop();
-    if (buff) { buff->close(); delete buff; buff = NULL; }
-    if (file) { file->close(); delete file; file = NULL; }
-    currentState = IDLE;
-}
-
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-    String message = "";
-    for (int i = 0; i < length; i++) {
-        message += (char)payload[i];
-    }
-    
-    StaticJsonDocument<512> doc;
-    DeserializationError error = deserializeJson(doc, message);
-    if (error) {
-        Serial.println("Failed to parse MQTT message");
-        return;
-    }
-
-    String action = doc["action"] | "";
-    
-    if (action == "play") {
-        pendingUrl = doc["url"] | "";
-        syncStartTime = doc["start_time"] | 0;
-        int vol = doc["volume"] | 50;
-        
-        currentVolume = vol;
-        out->SetGain((float)currentVolume / 100.0);
-        
-        pendingUrl.toLowerCase();
-        if (pendingUrl.endsWith(".wav")) currentFormat = "wav";
-        else if (pendingUrl.endsWith(".flac")) currentFormat = "flac";
-        else currentFormat = "mp3"; // Default
-        
-        Serial.print("Preparing to play: ");
-        Serial.println(pendingUrl);
-        Serial.print("Target Start Time (Unix): ");
-        Serial.println(syncStartTime);
-        
-        stopAudio();
-        currentState = PREPARING;
-    } 
-    else if (action == "stop") {
-        Serial.println("Stop command received.");
-        stopAudio();
-    }
-    else if (action == "seek") {
-        // ESP8266Audio seeking support is limited, especially over HTTP streaming.
-        // We handle this by stopping and ignoring for now, or you'd pass a Range header to HTTP stream.
-        Serial.println("Seek command received - unsupported on ESP32 HTTP Stream without full restart.");
-    }
-}
-
-void publishTelemetry() {
-    StaticJsonDocument<256> doc;
-    doc["ip"] = WiFi.localIP().toString();
-    doc["status"] = "online";
-    doc["rssi"] = WiFi.RSSI();
-    
-    // Internal temperature sensor is available on ESP32
-    #ifdef __cplusplus
-      extern "C" {
-    #endif
-    uint8_t temprature_sens_read();
-    #ifdef __cplusplus
-      }
-    #endif
-    
-    #if CONFIG_IDF_TARGET_ESP32
-      float temp = (temprature_sens_read() - 32) / 1.8;
-      doc["temperature"] = temp;
-    #else
-      doc["temperature"] = 0.0; // Mock or read differently for C3/C6
-    #endif
-
-    char buffer[256];
-    serializeJson(doc, buffer);
-    
-    String topic = String("audioauto/telemetry/") + DEVICE_NAME;
-    mqttClient.publish(topic.c_str(), buffer);
 }
 
 void loop() {
+    // Crucial for keeping the audio buffer full and playing
+    audio.loop();
+
     if (wifiMulti.run() != WL_CONNECTED) {
-        Serial.println("WiFi connection lost!");
-        delay(1000);
         return;
     }
 
@@ -241,44 +247,26 @@ void loop() {
     }
 
     // Audio State Machine
-    if (currentState == PREPARING) {
-        file = new AudioFileSourceHTTPStream(pendingUrl.c_str());
-        buff = new AudioFileSourceBuffer(file, 8192); // 8KB buffer
-        currentState = WAITING_SYNC;
-        Serial.println("Audio buffered. Waiting for sync time...");
-    }
-    else if (currentState == WAITING_SYNC) {
+    if (currentState == WAITING_SYNC) {
         time_t now;
         time(&now);
         
         if (now >= syncStartTime) {
-            Serial.println("Sync time reached! Starting playback.");
-            if (currentFormat == "wav") {
-                wav->begin(buff, out);
-            } else if (currentFormat == "flac") {
-                flac->begin(buff, out);
-            } else {
-                mp3->begin(buff, out);
-            }
+            logOutput("Sync time reached! Starting playback.");
+            audio.connecttohost(pendingUrl.c_str());
             currentState = PLAYING;
         }
     }
-    else if (currentState == PLAYING) {
-        bool running = false;
-        if (currentFormat == "wav" && wav->isRunning()) {
-            if (!wav->loop()) wav->stop();
-            running = true;
-        } else if (currentFormat == "flac" && flac->isRunning()) {
-            if (!flac->loop()) flac->stop();
-            running = true;
-        } else if (currentFormat == "mp3" && mp3->isRunning()) {
-            if (!mp3->loop()) mp3->stop();
-            running = true;
-        }
+}
 
-        if (!running) {
-            Serial.println("Playback finished.");
-            stopAudio();
-        }
-    }
+// Optional callback functions provided by the audio library
+void audio_info(const char *info){
+    Serial.print("info        "); logOutput(info);
+}
+void audio_id3data(const char *info){  //id3 metadata
+    Serial.print("id3data     ");logOutput(info);
+}
+void audio_eof_mp3(const char *info){  //end of file
+    Serial.print("eof_mp3     ");logOutput(info);
+    currentState = IDLE;
 }

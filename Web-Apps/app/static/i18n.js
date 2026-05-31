@@ -14,7 +14,16 @@ const translations = {
         add_schedule: "Add Schedule",
         device: "Device",
         time: "Time",
-        status: "Status"
+                status: "Status",
+        config_desc: "System and environment settings.",
+        sync_time: "Sync Time",
+        app_settings: "App Settings",
+        default_volume: "Default Volume",
+        timezone: "Timezone",
+        language: "Language",
+        save: "Save Changes",
+        env_vars: "Environment Variables",
+        repeat: "Repeat"
     },
     id: {
         dashboard: "Beranda",
@@ -31,7 +40,16 @@ const translations = {
         add_schedule: "Tambah Jadwal",
         device: "Perangkat",
         time: "Waktu",
-        status: "Status"
+                status: "Status",
+        config_desc: "Pengaturan sistem dan lingkungan.",
+        sync_time: "Sinkronisasi Waktu",
+        app_settings: "Pengaturan Aplikasi",
+        default_volume: "Volume Bawaan",
+        timezone: "Zona Waktu",
+        language: "Bahasa",
+        save: "Simpan Perubahan",
+        env_vars: "Variabel Lingkungan",
+        repeat: "Ulangi"
     }
 };
 

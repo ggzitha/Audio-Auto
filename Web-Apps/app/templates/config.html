@@ -3,40 +3,69 @@
 {% block title %}Configuration - Audio-Auto{% endblock %}
 
 {% block content %}
-<div class="mb-8">
-    <h2 class="text-3xl font-bold mb-2" data-i18n="config">Configuration</h2>
-    <p class="text-gray-500 dark:text-gray-400">System and environment settings.</p>
+<div class="mb-8 flex justify-between items-end">
+    <div>
+        <h2 class="text-3xl font-bold mb-2" data-i18n="config">Configuration</h2>
+        <p class="text-gray-500 dark:text-gray-400" data-i18n="config_desc">System and environment settings.</p>
+    </div>
+    <button id="btnSyncTime" class="bg-indigo-500 hover:bg-indigo-600 text-white font-bold py-2 px-4 rounded-xl shadow-lg transition-colors flex items-center">
+        <i class="fas fa-clock mr-2"></i> <span data-i18n="sync_time">Sync Time</span>
+    </button>
 </div>
 
-<div class="glass rounded-2xl p-6 shadow-xl max-w-3xl">
-    <h3 class="text-xl font-semibold mb-6 flex items-center border-b border-gray-200 dark:border-gray-700 pb-3">
-        <i class="fas fa-server text-primary mr-3"></i> Docker Environment Variables
-    </h3>
-    
-    <div class="space-y-4">
-        <div class="flex flex-col md:flex-row md:justify-between border-b border-gray-100 dark:border-gray-800 pb-2">
-            <span class="font-medium text-gray-700 dark:text-gray-300">Timezone (TZ)</span>
-            <span class="font-mono text-primary">Asia/Jayapura</span>
-        </div>
-        <div class="flex flex-col md:flex-row md:justify-between border-b border-gray-100 dark:border-gray-800 pb-2">
-            <span class="font-medium text-gray-700 dark:text-gray-300">MQTT Broker</span>
-            <span class="font-mono text-primary">192.168.88.8:1883</span>
-        </div>
-        <div class="flex flex-col md:flex-row md:justify-between border-b border-gray-100 dark:border-gray-800 pb-2">
-            <span class="font-medium text-gray-700 dark:text-gray-300">MQTT User</span>
-            <span class="font-mono text-primary">inskal</span>
-        </div>
-        <div class="flex flex-col md:flex-row md:justify-between pb-2">
-            <span class="font-medium text-gray-700 dark:text-gray-300">Database</span>
-            <span class="font-mono text-primary">MariaDB (audioauto)</span>
-        </div>
+<div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+    <div class="glass rounded-2xl p-6 shadow-xl">
+        <h3 class="text-xl font-semibold mb-6 flex items-center border-b border-gray-200 dark:border-gray-700 pb-3" data-i18n="app_settings">
+            <i class="fas fa-cogs text-primary mr-3"></i> App Settings
+        </h3>
+        <form id="configForm" class="space-y-4">
+            <div>
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1 flex justify-between">
+                    <span data-i18n="default_volume">Default Volume</span>
+                    <span id="cfgVolVal" class="text-primary font-semibold">50%</span>
+                </label>
+                <input type="range" id="cfgVol" name="default_volume" min="0" max="100" value="50" class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer dark:bg-gray-700 accent-primary">
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1" data-i18n="timezone">Timezone</label>
+                <input type="text" id="cfgTz" name="timezone" class="w-full bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 focus:ring-primary outline-none">
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1" data-i18n="language">Language</label>
+                <select id="cfgLang" name="language" class="w-full bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 focus:ring-primary outline-none">
+                    <option value="en">English</option>
+                    <option value="id">Bahasa Indonesia</option>
+                </select>
+            </div>
+            <div class="pt-4 flex justify-end">
+                <button type="submit" class="px-6 py-2 rounded-lg text-white bg-primary hover:bg-blue-600 transition-colors font-semibold" data-i18n="save">Save Changes</button>
+            </div>
+        </form>
     </div>
-    
-    <div class="mt-8 p-4 bg-yellow-50 dark:bg-yellow-900/20 border-l-4 border-yellow-400 rounded">
-        <p class="text-sm text-yellow-800 dark:text-yellow-200">
-            <i class="fas fa-info-circle mr-1"></i> These settings are configured via <code>docker-compose.yml</code>. To update them, modify the compose file and recreate the containers.
-        </p>
+
+    <div class="glass rounded-2xl p-6 shadow-xl">
+        <h3 class="text-xl font-semibold mb-6 flex items-center border-b border-gray-200 dark:border-gray-700 pb-3" data-i18n="env_vars">
+            <i class="fas fa-server text-primary mr-3"></i> Environment Variables
+        </h3>
+        <div class="space-y-4">
+            <div class="flex flex-col md:flex-row md:justify-between border-b border-gray-100 dark:border-gray-800 pb-2">
+                <span class="font-medium text-gray-700 dark:text-gray-300">MQTT Broker</span>
+                <span class="font-mono text-primary">192.168.88.8:1883</span>
+            </div>
+            <div class="flex flex-col md:flex-row md:justify-between border-b border-gray-100 dark:border-gray-800 pb-2">
+                <span class="font-medium text-gray-700 dark:text-gray-300">MQTT User</span>
+                <span class="font-mono text-primary">inskal</span>
+            </div>
+            <div class="flex flex-col md:flex-row md:justify-between pb-2">
+                <span class="font-medium text-gray-700 dark:text-gray-300">Database</span>
+                <span class="font-mono text-primary">MariaDB (audioauto)</span>
+            </div>
+        </div>
+        <div class="mt-8 p-4 bg-yellow-50 dark:bg-yellow-900/20 border-l-4 border-yellow-400 rounded">
+            <p class="text-sm text-yellow-800 dark:text-yellow-200">
+                <i class="fas fa-info-circle mr-1"></i> These settings are configured via <code>docker-compose.yml</code>. To update them, modify the compose file and recreate the containers.
+            </p>
+        </div>
     </div>
 </div>
-
 {% endblock %}

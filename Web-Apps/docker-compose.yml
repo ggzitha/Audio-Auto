@@ -11,7 +11,7 @@ services:
       MYSQL_PASSWORD: secure_db_password
       TZ: Asia/Jayapura
     volumes:
-      - db_data:/var/lib/mysql
+      - /mnt/Main_Storage/Docker_NFS/Docker_VE/500_webapps_AudioAuto/dbs_data:/var/lib/mysql
 
   web:
     build: .
@@ -27,12 +27,12 @@ services:
       - MQTT_PORT=1883
       - MQTT_USER=inskal
       - MQTT_PASS=admin_inskal_mqtt
+      - ADMIN_USER=admin
+      - ADMIN_PASS=admin123
       - TZ=Asia/Jayapura
     volumes:
-      - ./app:/app/app
-      - ./audio_files:/app/audio_files
+      - /mnt/Main_Storage/Docker_NFS/Docker_VE/500_webapps_AudioAuto/app:/app/app
+      - /mnt/Main_Storage/Docker_NFS/Docker_VE/500_webapps_AudioAuto/audio_files:/app/audio_files
     depends_on:
       - db
 
-volumes:
-  db_data:

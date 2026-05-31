@@ -5,6 +5,13 @@ from datetime import datetime
 
 Base = declarative_base()
 
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(50), unique=True, index=True)
+    password_hash = Column(String(255))
+
 class Device(Base):
     __tablename__ = "devices"
 
@@ -32,7 +39,15 @@ class Schedule(Base):
     device_name = Column(String(100)) # "all" or specific device name
     audio_id = Column(Integer, ForeignKey("audio_files.id"))
     play_time = Column(DateTime)
+    repeat = Column(String(50), default="none")
     volume = Column(Integer, default=50)
     is_active = Column(Boolean, default=True)
 
     audio = relationship("AudioFile")
+
+class SystemConfig(Base):
+    __tablename__ = "system_config"
+    id = Column(Integer, primary_key=True, index=True)
+    default_volume = Column(Integer, default=50)
+    timezone = Column(String(50), default="Asia/Jayapura")
+    language = Column(String(10), default="en")

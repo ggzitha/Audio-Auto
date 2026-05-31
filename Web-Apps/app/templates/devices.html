@@ -3,71 +3,31 @@
 {% block title %}Devices - Audio-Auto{% endblock %}
 
 {% block content %}
-<div class="mb-8">
-    <h2 class="text-3xl font-bold mb-2" data-i18n="devices">Devices</h2>
-    <p class="text-gray-500 dark:text-gray-400">Monitor status of connected ESP32 clients.</p>
+<div class="max-w-7xl mx-auto">
+    <div class="flex justify-between items-center mb-8">
+        <h2 class="text-3xl font-bold" data-i18n="devices">Devices</h2>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6" id="deviceGrid">
+        <!-- Devices injected via JS -->
+    </div>
 </div>
 
-<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6" id="deviceGrid">
-    <!-- Devices will be populated here by JS -->
-</div>
-
-{% endblock %}
-
-{% block scripts %}
 <script>
-    function renderDevices() {
-        fetch('/api/devices').then(r=>r.json()).then(devices => {
-            const grid = document.getElementById('deviceGrid');
-            if(devices.length === 0) {
-                grid.innerHTML = `<div class="col-span-full text-center py-10 text-gray-500">No devices registered yet. Provide MQTT connection to ESP32s to auto-register.</div>`;
-                return;
-            }
-            
-            grid.innerHTML = devices.map(d => {
-                const isOnline = d.status === 'online';
-                const statusColor = isOnline ? 'bg-green-500' : 'bg-red-500';
-                const lastSeen = new Date(d.last_seen).toLocaleString();
-                
-                return `
-                <div class="glass rounded-2xl p-6 shadow-lg relative overflow-hidden transition-transform hover:-translate-y-1">
-                    <div class="flex justify-between items-start mb-4">
-                        <h3 class="text-lg font-bold text-gray-800 dark:text-gray-100 flex items-center">
-                            <i class="fas fa-microchip text-primary mr-2"></i> ${d.name}
-                        </h3>
-                        <span class="flex items-center text-xs font-semibold px-2 py-1 rounded-full ${isOnline ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400' : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400'}">
-                            <span class="w-2 h-2 rounded-full ${statusColor} mr-1 animate-pulse"></span> ${d.status.toUpperCase()}
-                        </span>
-                    </div>
-                    
-                    <div class="space-y-3 text-sm text-gray-600 dark:text-gray-400">
-                        <div class="flex justify-between border-b border-gray-200 dark:border-gray-700 pb-1">
-                            <span><i class="fas fa-network-wired mr-2"></i> IP Address</span>
-                            <span class="font-mono text-gray-900 dark:text-gray-200">${d.ip_address || 'Unknown'}</span>
-                        </div>
-                        <div class="flex justify-between border-b border-gray-200 dark:border-gray-700 pb-1">
-                            <span><i class="fas fa-wifi mr-2"></i> Signal (RSSI)</span>
-                            <span class="font-mono text-gray-900 dark:text-gray-200">${d.rssi} dBm</span>
-                        </div>
-                        <div class="flex justify-between border-b border-gray-200 dark:border-gray-700 pb-1">
-                            <span><i class="fas fa-thermometer-half mr-2"></i> Temperature</span>
-                            <span class="font-mono text-gray-900 dark:text-gray-200">${d.temperature}°C</span>
-                        </div>
-                        <div class="flex justify-between pt-1 text-xs">
-                            <span>Last Seen</span>
-                            <span>${lastSeen}</span>
-                        </div>
-                    </div>
-                </div>
-                `;
-            }).join('');
-        });
+// SPA handles fetching devices. We just need to handle the log events here.
+window.addEventListener('deviceLog', function(e) {
+    const data = e.detail;
+    if(data.device === 'Web App') return;
+    
+    const term = document.getElementById('term-' + data.device);
+    if(term) {
+        const line = document.createElement('div');
+        line.innerText = data.msg;
+        term.appendChild(line);
+        // keep max 50 lines
+        if(term.children.length > 50) term.removeChild(term.firstChild);
+        term.scrollTop = term.scrollHeight;
     }
-
-    document.addEventListener('DOMContentLoaded', () => {
-        renderDevices();
-        // Auto refresh every 10 seconds
-        setInterval(renderDevices, 10000);
-    });
+});
 </script>
 {% endblock %}
