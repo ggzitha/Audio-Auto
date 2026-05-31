@@ -141,8 +141,16 @@ def add_schedule_job(sch: models.Schedule):
             id=f"sched_{sch.id}"
         )
 
+main_loop = None
+
 @app.on_event("startup")
 def startup_event():
+    global main_loop
+    try:
+        main_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+
     # Attempt schema migrations safely
     db = database.SessionLocal()
     try:
