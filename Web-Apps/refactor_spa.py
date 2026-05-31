@@ -1,4 +1,6 @@
-// app/static/spa.js
+﻿import sys
+
+new_spa = '''// app/static/spa.js
 document.addEventListener('DOMContentLoaded', () => {
 
     const mainContent = document.getElementById('spa-content');
@@ -565,3 +567,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initPageScripts(location.pathname);
     updatePlayerVisibility(location.pathname);
 });
+'''
+
+with open('d:/004_Programming_Things/Arduino/AI-Coded/Audio-Auto/Web-Apps/app/static/spa.js', 'w') as f:
+    f.write(new_spa)

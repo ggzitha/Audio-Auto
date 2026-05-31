@@ -137,8 +137,10 @@
     <script src="/static/i18n.js"></script>
     <script src="/static/app.js"></script>
     {% if request.session.get('user_id') %}
-    <script src="/static/spa.js"></script>
+    <script src="/static/spa.js?v={{ cache_buster }}"></script>
     {% endif %}
     {% block scripts %}{% endblock %}
+
+    <script src="https://unpkg.com/wavesurfer.js@7/dist/wavesurfer.min.js"></script>
 </body>
 </html>

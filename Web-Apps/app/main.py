@@ -32,6 +32,23 @@ for i in range(max_retries):
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
+
+class PlaybackState(BaseModel):
+    audio_id: int | None = None
+    is_playing: bool = False
+    position: float = 0.0
+    volume: int = 50
+    speed: float = 1.0
+    last_updated: float = 0.0
+
+global_state = PlaybackState()
+
+def broadcast_state():
+    global main_loop
+    global_state.last_updated = time.time()
+    if main_loop and main_loop.is_running():
+        asyncio.run_coroutine_threadsafe(manager.broadcast({"type": "state", "state": global_state.dict()}), main_loop)
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: list[WebSocket] = []
@@ -209,13 +226,13 @@ def shutdown_event():
 # --- Auth Routes ---
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
-    return templates.TemplateResponse("login.html", {"request": request})
+    return templates.TemplateResponse("login.html", {"request": request, "cache_buster": int(time.time())})
 
 @app.post("/login")
 def login_submit(request: Request, username: str = Form(...), password: str = Form(...), db: Session = Depends(database.get_db)):
     user = db.query(models.User).filter(models.User.username == username).first()
     if not user or not pwd_context.verify(password, user.password_hash):
-        return templates.TemplateResponse("login.html", {"request": request, "error": "Invalid credentials"})
+        return templates.TemplateResponse("login.html", {"request": request, "cache_buster": int(time.time()), "error": "Invalid credentials"})
     request.session["user_id"] = user.id
     return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
 
@@ -227,24 +244,29 @@ def logout(request: Request):
 # --- HTML Routes ---
 @app.get("/", response_class=HTMLResponse)
 def read_root(request: Request, user=Depends(require_auth)):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse("index.html", {"request": request, "cache_buster": int(time.time())})
 
 @app.get("/scheduler", response_class=HTMLResponse)
 def read_scheduler(request: Request, user=Depends(require_auth)):
-    return templates.TemplateResponse("scheduler.html", {"request": request})
+    return templates.TemplateResponse("scheduler.html", {"request": request, "cache_buster": int(time.time())})
 
 @app.get("/devices", response_class=HTMLResponse)
 def read_devices(request: Request, user=Depends(require_auth)):
-    return templates.TemplateResponse("devices.html", {"request": request})
+    return templates.TemplateResponse("devices.html", {"request": request, "cache_buster": int(time.time())})
 
 @app.get("/config", response_class=HTMLResponse)
 def read_config(request: Request, user=Depends(require_auth)):
-    return templates.TemplateResponse("config.html", {"request": request})
+    return templates.TemplateResponse("config.html", {"request": request, "cache_buster": int(time.time())})
 
 @app.get("/help", response_class=HTMLResponse)
 def read_help(request: Request, user=Depends(require_auth)):
-    return templates.TemplateResponse("help.html", {"request": request})
+    return templates.TemplateResponse("help.html", {"request": request, "cache_buster": int(time.time())})
 
+
+@app.get("/api/state")
+def get_global_state():
+    return global_state.dict()
+    
 # --- API Routes ---
 @app.get("/api/devices")
 def get_devices(db: Session = Depends(database.get_db), user=Depends(require_auth)):
@@ -398,12 +420,25 @@ def realtime_play(device_name: str = Form("all"), audio_id: int = Form(...), vol
         "volume": volume,
         "position": position
     }
+
+    global global_state
+    global_state.audio_id = audio_id
+    global_state.is_playing = True
+    global_state.position = position
+    global_state.volume = volume
+    broadcast_state()
+    
     mqtt_handler.publish_command(device_name, cmd)
     return {"message": "Play command sent"}
 
 @app.post("/api/stop")
 def realtime_stop(device_name: str = Form("all"), user=Depends(require_auth)):
     cmd = {"action": "stop"}
+
+    global global_state
+    global_state.is_playing = False
+    broadcast_state()
+    
     mqtt_handler.publish_command(device_name, cmd)
     return {"message": "Stop command sent"}
 
@@ -414,6 +449,11 @@ def realtime_seek(device_name: str = Form("all"), position: float = Form(...), u
         "position": position,
         "start_time": int(time.time()) + 2
     }
+
+    global global_state
+    global_state.position = position
+    broadcast_state()
+    
     mqtt_handler.publish_command(device_name, cmd)
     return {"message": "Seek command sent"}
 
@@ -423,6 +463,11 @@ def realtime_speed(device_name: str = Form("all"), speed: float = Form(1.0), use
         "action": "speed",
         "speed": speed
     }
+
+    global global_state
+    global_state.speed = speed
+    broadcast_state()
+    
     mqtt_handler.publish_command(device_name, cmd)
     return {"message": "Speed command sent"}
 
