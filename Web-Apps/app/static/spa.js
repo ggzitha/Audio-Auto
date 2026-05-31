@@ -530,6 +530,33 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
     
+    // --- Global WebSocket for Logs ---
+    let ws = null;
+    function connectWebSocket() {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+        
+        ws.onmessage = function(event) {
+            try {
+                const data = JSON.parse(event.data);
+                if(data.type === 'log') {
+                    const logContainer = document.getElementById('log-' + data.device);
+                    if(logContainer) {
+                        const entry = document.createElement('div');
+                        entry.innerText = data.text;
+                        logContainer.appendChild(entry);
+                        logContainer.scrollTop = logContainer.scrollHeight;
+                    }
+                }
+            } catch(e) { console.error(e); }
+        };
+        
+        ws.onclose = function() {
+            setTimeout(connectWebSocket, 3000); // Reconnect
+        };
+    }
+    connectWebSocket();
+
     // Initial run
     initPageScripts(location.pathname);
     updatePlayerVisibility(location.pathname);
