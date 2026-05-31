@@ -1,0 +1,65 @@
+import os
+import paho.mqtt.client as mqtt
+import json
+from datetime import datetime
+from .database import SessionLocal
+from .models import Device
+
+MQTT_BROKER = os.environ.get("MQTT_BROKER", "192.168.88.8")
+MQTT_PORT = int(os.environ.get("MQTT_PORT", 1883))
+MQTT_USER = os.environ.get("MQTT_USER", "inskal")
+MQTT_PASS = os.environ.get("MQTT_PASS", "admin_inskal_mqtt")
+
+client = mqtt.Client(client_id="fastapi_backend")
+
+def on_connect(client, userdata, flags, rc):
+    print(f"Connected to MQTT broker with result code {rc}")
+    client.subscribe("audioauto/telemetry/#")
+
+def on_message(client, userdata, msg):
+    try:
+        topic = msg.topic
+        payload = json.loads(msg.payload.decode())
+        
+        # Topic format: audioauto/telemetry/{device_name}
+        parts = topic.split("/")
+        if len(parts) == 3:
+            device_name = parts[2]
+            
+            db = SessionLocal()
+            device = db.query(Device).filter(Device.name == device_name).first()
+            if not device:
+                device = Device(name=device_name)
+                db.add(device)
+            
+            device.ip_address = payload.get("ip", device.ip_address)
+            device.status = payload.get("status", "online")
+            device.rssi = payload.get("rssi", device.rssi)
+            device.temperature = payload.get("temperature", device.temperature)
+            device.last_seen = datetime.utcnow()
+            
+            db.commit()
+            db.close()
+    except Exception as e:
+        print(f"Error processing MQTT message: {e}")
+
+client.on_connect = on_connect
+client.on_message = on_message
+
+if MQTT_USER and MQTT_PASS:
+    client.username_pw_set(MQTT_USER, MQTT_PASS)
+
+def start_mqtt():
+    try:
+        client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        client.loop_start()
+    except Exception as e:
+        print(f"Failed to connect to MQTT: {e}")
+
+def publish_command(device_name: str, command: dict):
+    """
+    Publish a command to a specific device or 'all'.
+    Command is a dictionary, e.g., {"action": "play", "url": "...", "start_time": 12345}
+    """
+    topic = f"audioauto/commands/{device_name}"
+    client.publish(topic, json.dumps(command))

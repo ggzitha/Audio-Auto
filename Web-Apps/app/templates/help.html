@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+
+{% block title %}Help - Audio-Auto{% endblock %}
+
+{% block content %}
+<div class="mb-8">
+    <h2 class="text-3xl font-bold mb-2" data-i18n="help">Help</h2>
+    <p class="text-gray-500 dark:text-gray-400">Step-by-step guide to configuring and adding ESP32 clients.</p>
+</div>
+
+<div class="space-y-6 max-w-4xl">
+    
+    <!-- Step 1 -->
+    <div class="glass rounded-2xl p-6 shadow-lg">
+        <h3 class="text-xl font-bold mb-3 text-primary flex items-center">
+            <span class="bg-primary text-white w-8 h-8 rounded-full flex justify-center items-center mr-3 text-sm">1</span> 
+            Preparing the Hardware
+        </h3>
+        <p class="text-gray-700 dark:text-gray-300 mb-4 leading-relaxed">
+            The system supports standard ESP32 (using internal DAC) and ESP32-C3/C6 (using an external PCM5102 I2S module).
+        </p>
+        <ul class="list-disc pl-5 space-y-2 text-gray-600 dark:text-gray-400">
+            <li>For <strong>ESP32</strong>: Connect external speakers to GPIO25 or GPIO26 (Internal DAC) and GND. Note that audio quality will be lower (8-bit).</li>
+            <li>For <strong>ESP32-C3 / C6</strong>: Connect a PCM5102 module via I2S. Connect BCLK, LRC, and DIN to the assigned pins in the Arduino Sketch. Connect the Aux Out from PCM5102 to your speakers.</li>
+        </ul>
+    </div>
+
+    <!-- Step 2 -->
+    <div class="glass rounded-2xl p-6 shadow-lg">
+        <h3 class="text-xl font-bold mb-3 text-primary flex items-center">
+            <span class="bg-primary text-white w-8 h-8 rounded-full flex justify-center items-center mr-3 text-sm">2</span> 
+            Configuring the Arduino Sketch
+        </h3>
+        <p class="text-gray-700 dark:text-gray-300 mb-4 leading-relaxed">
+            Open the <code>Audio_Client.ino</code> file in the Arduino IDE. You need to configure a few specific variables for each device before flashing.
+        </p>
+        <div class="bg-gray-100 dark:bg-gray-800 p-4 rounded-lg font-mono text-sm overflow-x-auto mb-4 text-gray-800 dark:text-gray-200">
+            // Set a unique name for each ESP32. This name will appear in the Dashboard.<br>
+            const char* DEVICE_NAME = "ESP32-Ruang-A001";
+        </div>
+        <p class="text-gray-700 dark:text-gray-300 leading-relaxed">
+            The code already contains the 3 WiFi SSIDs and the MQTT credentials. The ESP32 will automatically connect to the strongest available WiFi network.
+        </p>
+    </div>
+
+    <!-- Step 3 -->
+    <div class="glass rounded-2xl p-6 shadow-lg">
+        <h3 class="text-xl font-bold mb-3 text-primary flex items-center">
+            <span class="bg-primary text-white w-8 h-8 rounded-full flex justify-center items-center mr-3 text-sm">3</span> 
+            Auto-Registration
+        </h3>
+        <p class="text-gray-700 dark:text-gray-300 leading-relaxed">
+            Once flashed, power on the ESP32. It will:
+            <ol class="list-decimal pl-5 mt-2 space-y-2 text-gray-600 dark:text-gray-400">
+                <li>Connect to WiFi.</li>
+                <li>Sync time with NTP (pool.ntp.org) to UTC+9.</li>
+                <li>Connect to the MQTT Broker (192.168.88.8).</li>
+                <li>Start publishing telemetry data (Status, IP, RSSI, Temp).</li>
+            </ol>
+            As soon as the web application receives the first MQTT telemetry message, the device will be <strong>automatically registered</strong> and appear on the <a href="/devices" class="text-primary hover:underline">Devices page</a>.
+        </p>
+    </div>
+
+    <!-- Step 4 -->
+    <div class="glass rounded-2xl p-6 shadow-lg">
+        <h3 class="text-xl font-bold mb-3 text-primary flex items-center">
+            <span class="bg-primary text-white w-8 h-8 rounded-full flex justify-center items-center mr-3 text-sm">4</span> 
+            Scheduling Audio
+        </h3>
+        <p class="text-gray-700 dark:text-gray-300 leading-relaxed">
+            To schedule audio playback:
+            <ol class="list-decimal pl-5 mt-2 space-y-2 text-gray-600 dark:text-gray-400">
+                <li>Upload an audio file (.mp3, .wav, .flac) via the <a href="/" class="text-primary hover:underline">Dashboard</a>.</li>
+                <li>Go to the <a href="/scheduler" class="text-primary hover:underline">Scheduler</a> page.</li>
+                <li>Click <strong>Add Schedule</strong>.</li>
+                <li>Select the target Device (or All Devices), the Audio File, and set the precise Date & Time and Volume.</li>
+                <li>The server will automatically trigger playback exactly at the scheduled time with zero delay synchronization across all devices.</li>
+            </ol>
+        </p>
+    </div>
+
+</div>
+
+{% endblock %}

@@ -1,0 +1,168 @@
+{% extends "base.html" %}
+
+{% block title %}Scheduler - Audio-Auto{% endblock %}
+
+{% block content %}
+<div class="mb-8 flex justify-between items-end">
+    <div>
+        <h2 class="text-3xl font-bold mb-2" data-i18n="scheduler">Scheduler</h2>
+        <p class="text-gray-500 dark:text-gray-400">Automate audio playback across your devices.</p>
+    </div>
+    <button onclick="openScheduleModal()" class="bg-primary hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-xl shadow-lg transition-colors flex items-center">
+        <i class="fas fa-plus mr-2"></i> <span data-i18n="add_schedule">Add Schedule</span>
+    </button>
+</div>
+
+<div class="glass rounded-2xl p-6 shadow-xl relative overflow-hidden">
+    <div id="calendar" class="w-full h-[600px] text-gray-800 dark:text-gray-200"></div>
+</div>
+
+<!-- Add Schedule Modal -->
+<div id="scheduleModal" class="fixed inset-0 bg-black bg-opacity-50 hidden z-50 flex items-center justify-center backdrop-blur-sm">
+    <div class="bg-white dark:bg-darkcard w-full max-w-md rounded-2xl shadow-2xl p-6 transform scale-95 transition-transform duration-300" id="modalContent">
+        <div class="flex justify-between items-center mb-6">
+            <h3 class="text-xl font-bold" data-i18n="add_schedule">Add Schedule</h3>
+            <button onclick="closeScheduleModal()" class="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"><i class="fas fa-times text-xl"></i></button>
+        </div>
+        
+        <form id="scheduleForm" class="space-y-4">
+            <div>
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1" data-i18n="device">Device</label>
+                <select id="schedDevice" class="w-full bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 focus:ring-primary focus:border-primary">
+                    <option value="all">All Devices</option>
+                </select>
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Audio File</label>
+                <select id="schedAudio" class="w-full bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 focus:ring-primary focus:border-primary"></select>
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1" data-i18n="time">Date & Time</label>
+                <input type="datetime-local" step="1" id="schedTime" class="w-full bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 focus:ring-primary focus:border-primary text-gray-900 dark:text-white" required>
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1 flex justify-between">
+                    <span data-i18n="volume">Volume</span>
+                    <span id="schedVolVal" class="text-primary font-semibold">50%</span>
+                </label>
+                <input type="range" id="schedVol" min="0" max="100" value="50" class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer dark:bg-gray-700 accent-primary">
+            </div>
+            
+            <div class="pt-4 flex justify-end space-x-3">
+                <button type="button" onclick="closeScheduleModal()" class="px-4 py-2 rounded-lg text-gray-700 bg-gray-200 hover:bg-gray-300 dark:text-gray-300 dark:bg-gray-700 dark:hover:bg-gray-600 transition-colors">Cancel</button>
+                <button type="submit" class="px-4 py-2 rounded-lg text-white bg-primary hover:bg-blue-600 transition-colors">Save</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script src='https://cdn.jsdelivr.net/npm/fullcalendar@6.1.11/index.global.min.js'></script>
+<script>
+    let calendar;
+
+    function fetchSchedules() {
+        fetch('/api/schedules').then(r=>r.json()).then(data => {
+            const events = data.map(s => ({
+                id: s.id,
+                title: `${s.audio_name} -> ${s.device_name}`,
+                start: s.play_time,
+                backgroundColor: s.is_active ? '#3b82f6' : '#6b7280',
+                borderColor: s.is_active ? '#2563eb' : '#4b5563',
+                extendedProps: { volume: s.volume }
+            }));
+            if(calendar) {
+                calendar.removeAllEvents();
+                calendar.addEventSource(events);
+            }
+        });
+    }
+
+    document.addEventListener('DOMContentLoaded', function() {
+        const calendarEl = document.getElementById('calendar');
+        calendar = new FullCalendar.Calendar(calendarEl, {
+            initialView: 'dayGridMonth',
+            headerToolbar: {
+                left: 'prev,next today',
+                center: 'title',
+                right: 'dayGridMonth,timeGridWeek,timeGridDay'
+            },
+            themeSystem: 'standard',
+            events: [],
+            eventClick: function(info) {
+                Swal.fire({
+                    title: info.event.title,
+                    text: `Time: ${info.event.start.toLocaleString()} | Volume: ${info.event.extendedProps.volume}%`,
+                    icon: 'info',
+                    showCancelButton: true,
+                    confirmButtonColor: '#d33',
+                    cancelButtonColor: '#3085d6',
+                    confirmButtonText: 'Delete Schedule'
+                }).then((result) => {
+                    if (result.isConfirmed) {
+                        fetch(`/api/schedule/${info.event.id}`, {method: 'DELETE'})
+                        .then(() => {
+                            info.event.remove();
+                            Swal.fire('Deleted!', 'Schedule has been deleted.', 'success');
+                        });
+                    }
+                });
+            }
+        });
+        calendar.render();
+        fetchSchedules();
+
+        // Populate selects
+        fetch('/api/files').then(r=>r.json()).then(files => {
+            document.getElementById('schedAudio').innerHTML = files.map(f => `<option value="${f.id}">${f.original_name}</option>`).join('');
+        });
+        fetch('/api/devices').then(r=>r.json()).then(devices => {
+            const devs = devices.map(d => `<option value="${d.name}">${d.name}</option>`).join('');
+            document.getElementById('schedDevice').innerHTML = `<option value="all">All Devices</option>` + devs;
+        });
+
+        // Form submit
+        document.getElementById('scheduleForm').addEventListener('submit', (e) => {
+            e.preventDefault();
+            const formData = new FormData();
+            formData.append('device_name', document.getElementById('schedDevice').value);
+            formData.append('audio_id', document.getElementById('schedAudio').value);
+            formData.append('play_time', document.getElementById('schedTime').value);
+            formData.append('volume', document.getElementById('schedVol').value);
+
+            fetch('/api/schedule', {method: 'POST', body: formData})
+            .then(r=>r.json()).then(res => {
+                closeScheduleModal();
+                fetchSchedules();
+                Swal.fire('Success', 'Schedule added successfully', 'success');
+            }).catch(err => Swal.fire('Error', 'Failed to add schedule', 'error'));
+        });
+
+        document.getElementById('schedVol').addEventListener('input', (e) => {
+            document.getElementById('schedVolVal').innerText = e.target.value + '%';
+        });
+    });
+
+    function openScheduleModal() {
+        const m = document.getElementById('scheduleModal');
+        const mc = document.getElementById('modalContent');
+        m.classList.remove('hidden');
+        setTimeout(() => { mc.classList.remove('scale-95'); mc.classList.add('scale-100'); }, 10);
+    }
+    
+    function closeScheduleModal() {
+        const m = document.getElementById('scheduleModal');
+        const mc = document.getElementById('modalContent');
+        mc.classList.remove('scale-100'); mc.classList.add('scale-95');
+        setTimeout(() => m.classList.add('hidden'), 300);
+    }
+</script>
+<style>
+    .fc-theme-standard td, .fc-theme-standard th { border-color: rgba(156, 163, 175, 0.2); }
+    .dark .fc-theme-standard td, .dark .fc-theme-standard th { border-color: rgba(75, 85, 99, 0.4); }
+    .dark .fc-col-header-cell-cushion { color: #e5e7eb; }
+    .dark .fc-daygrid-day-number { color: #d1d5db; }
+</style>
+{% endblock %}

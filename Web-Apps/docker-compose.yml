@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  db:
+    image: mariadb:10.11
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: secure_root_password
+      MYSQL_DATABASE: audioauto
+      MYSQL_USER: audioauto
+      MYSQL_PASSWORD: secure_db_password
+      TZ: Asia/Jayapura
+    volumes:
+      - db_data:/var/lib/mysql
+
+  web:
+    build: .
+    restart: always
+    ports:
+      - "9876:8000"
+    environment:
+      - DB_USER=audioauto
+      - DB_PASS=secure_db_password
+      - DB_HOST=db
+      - DB_NAME=audioauto
+      - MQTT_BROKER=192.168.88.8
+      - MQTT_PORT=1883
+      - MQTT_USER=inskal
+      - MQTT_PASS=admin_inskal_mqtt
+      - TZ=Asia/Jayapura
+    volumes:
+      - ./app:/app/app
+      - ./audio_files:/app/audio_files
+    depends_on:
+      - db
+
+volumes:
+  db_data:

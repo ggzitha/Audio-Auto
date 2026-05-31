@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+
+{% block title %}Configuration - Audio-Auto{% endblock %}
+
+{% block content %}
+<div class="mb-8">
+    <h2 class="text-3xl font-bold mb-2" data-i18n="config">Configuration</h2>
+    <p class="text-gray-500 dark:text-gray-400">System and environment settings.</p>
+</div>
+
+<div class="glass rounded-2xl p-6 shadow-xl max-w-3xl">
+    <h3 class="text-xl font-semibold mb-6 flex items-center border-b border-gray-200 dark:border-gray-700 pb-3">
+        <i class="fas fa-server text-primary mr-3"></i> Docker Environment Variables
+    </h3>
+    
+    <div class="space-y-4">
+        <div class="flex flex-col md:flex-row md:justify-between border-b border-gray-100 dark:border-gray-800 pb-2">
+            <span class="font-medium text-gray-700 dark:text-gray-300">Timezone (TZ)</span>
+            <span class="font-mono text-primary">Asia/Jayapura</span>
+        </div>
+        <div class="flex flex-col md:flex-row md:justify-between border-b border-gray-100 dark:border-gray-800 pb-2">
+            <span class="font-medium text-gray-700 dark:text-gray-300">MQTT Broker</span>
+            <span class="font-mono text-primary">192.168.88.8:1883</span>
+        </div>
+        <div class="flex flex-col md:flex-row md:justify-between border-b border-gray-100 dark:border-gray-800 pb-2">
+            <span class="font-medium text-gray-700 dark:text-gray-300">MQTT User</span>
+            <span class="font-mono text-primary">inskal</span>
+        </div>
+        <div class="flex flex-col md:flex-row md:justify-between pb-2">
+            <span class="font-medium text-gray-700 dark:text-gray-300">Database</span>
+            <span class="font-mono text-primary">MariaDB (audioauto)</span>
+        </div>
+    </div>
+    
+    <div class="mt-8 p-4 bg-yellow-50 dark:bg-yellow-900/20 border-l-4 border-yellow-400 rounded">
+        <p class="text-sm text-yellow-800 dark:text-yellow-200">
+            <i class="fas fa-info-circle mr-1"></i> These settings are configured via <code>docker-compose.yml</code>. To update them, modify the compose file and recreate the containers.
+        </p>
+    </div>
+</div>
+
+{% endblock %}
