@@ -23,6 +23,11 @@ document.addEventListener('DOMContentLoaded', () => {
         if(!container) return; // Not on dashboard
         if(wavesurfer) return; // Already initialized
         
+        if(typeof WaveSurfer === 'undefined') {
+            console.error("WaveSurfer is not loaded! Check internet connection.");
+            return;
+        }
+        
         wavesurfer = WaveSurfer.create({
             container: '#waveformContainer',
             waveColor: '#4b5563', // Tailwind gray-600
@@ -124,8 +129,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 
                 // Update WaveSurfer track if changed
                 if(wavesurfer) {
-                    const currentUrl = wavesurfer.getMediaElement()?.src || '';
-                    if(!currentUrl.endsWith(fileObj.filename)) {
+                    const currentUrl = (wavesurfer.getMediaElement && wavesurfer.getMediaElement()) ? wavesurfer.getMediaElement().src : (wavesurfer.media ? wavesurfer.media.src : '');
+                    if(!currentUrl || !currentUrl.endsWith(fileObj.filename)) {
                         wavesurfer.load('/audio_files/' + fileObj.filename);
                         // The 'ready' event will handle play/seek sync
                         return; 
@@ -198,7 +203,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- Player Controls (UI Interactions) ---
     function togglePlay() {
         if(!window.globalState.audio_id && window.allFiles.length > 0) {
-            window.selectSong(window.allFiles[0]); // Starts playing automatically
+            window.selectSong(window.allFiles[0].id); // Starts playing automatically
             return;
         }
         if(window.globalState.audio_id) {
@@ -219,19 +224,19 @@ document.addEventListener('DOMContentLoaded', () => {
         if(window.allFiles.length === 0) return;
         let idx = window.allFiles.findIndex(f => f.id === window.globalState.audio_id);
         idx = (idx + 1) % window.allFiles.length;
-        window.selectSong(window.allFiles[idx]);
+        window.selectSong(window.allFiles[idx].id);
     }
     
     function playPrev() {
         if(window.allFiles.length === 0) return;
         let idx = window.allFiles.findIndex(f => f.id === window.globalState.audio_id);
         idx = (idx - 1 + window.allFiles.length) % window.allFiles.length;
-        window.selectSong(window.allFiles[idx]);
+        window.selectSong(window.allFiles[idx].id);
     }
 
-    window.selectSong = function(fileObj) {
+    window.selectSong = function(id) {
         pushStateChange('play', { 
-            audio_id: fileObj.id, 
+            audio_id: id, 
             volume: window.globalState.volume, 
             position: 0 
         });
@@ -321,7 +326,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             playlistContainer.innerHTML = files.map(f => `
                 <div class="flex items-center justify-between px-6 py-4 hover:bg-gray-50 dark:hover:bg-[#253246] transition-colors group cursor-pointer" data-id="${f.id}">
-                    <div class="flex items-center space-x-4" onclick='window.selectSong(${JSON.stringify(f).replace(/'/g, "\\'")})'>
+                    <div class="flex items-center space-x-4" onclick="window.selectSong(${f.id})">
                         <div class="h-10 w-10 rounded-full bg-blue-100 dark:bg-blue-900/30 flex items-center justify-center text-primary group-hover:scale-110 transition-transform">
                             <i class="fas fa-music"></i>
                         </div>
@@ -360,44 +365,36 @@ document.addEventListener('DOMContentLoaded', () => {
             });
         };
         
-        const uploadForm = document.getElementById('uploadForm');
-        const fileInput = document.getElementById('audioFile');
-        if(uploadForm && fileInput) {
-            uploadForm.addEventListener('submit', async (e) => {
-                e.preventDefault();
+        const fileInput = document.getElementById('fileInput');
+        if(fileInput) {
+            fileInput.addEventListener('change', async () => {
                 if(!fileInput.files.length) return;
-                
                 const formData = new FormData();
                 formData.append('file', fileInput.files[0]);
                 
-                const btn = uploadForm.querySelector('button');
-                const origHtml = btn.innerHTML;
-                btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Uploading...';
-                btn.disabled = true;
+                const uploadStatus = document.getElementById('uploadStatus');
+                const uploadBar = document.getElementById('uploadBar');
+                
+                if(uploadStatus) uploadStatus.classList.remove('hidden');
+                if(uploadBar) uploadBar.style.width = '50%';
                 
                 try {
                     const r = await fetch('/api/upload', { method: 'POST', body: formData });
                     if(r.ok) {
-                        const files = await (await fetch('/api/files')).json();
-                        window.allFiles = files;
-                        renderPlaylist(files);
-                        Swal.fire({
-                            toast: true,
-                            position: 'top-end',
-                            icon: 'success',
-                            title: 'Upload complete',
-                            showConfirmButton: false,
-                            timer: 3000
-                        });
-                        uploadForm.reset();
+                        if(uploadBar) uploadBar.style.width = '100%';
+                        setTimeout(async () => {
+                            if(uploadStatus) uploadStatus.classList.add('hidden');
+                            if(uploadBar) uploadBar.style.width = '0%';
+                            const files = await (await fetch('/api/files')).json();
+                            window.allFiles = files;
+                            renderPlaylist(files);
+                        }, 500);
                     } else {
                         throw new Error('Upload failed');
                     }
                 } catch(e) {
                     Swal.fire('Error', e.message, 'error');
-                } finally {
-                    btn.innerHTML = origHtml;
-                    btn.disabled = false;
+                    if(uploadStatus) uploadStatus.classList.add('hidden');
                 }
             });
         }
