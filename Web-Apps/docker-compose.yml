@@ -11,7 +11,16 @@ services:
       MYSQL_PASSWORD: secure_db_password
       TZ: Asia/Jayapura
     volumes:
-      - /mnt/Main_Storage/Docker_NFS/Docker_VE/500_webapps_AudioAuto/dbs_data:/var/lib/mysql
+      - ./dbs_data:/var/lib/mysql
+    # If you have an existing dbs_data from before, the above credentials MUST
+    # match what was used when the database was first initialized.
+    # To reset completely: stop containers, delete ./dbs_data folder, then restart.
+    command: >
+      --bind-address=0.0.0.0
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+    networks:
+      - audioauto_net
 
   web:
     build: .
@@ -27,12 +36,18 @@ services:
       - MQTT_PORT=1883
       - MQTT_USER=inskal
       - MQTT_PASS=admin_inskal_mqtt
+      # Web UI login credentials (first-run creates this admin user in DB)
       - ADMIN_USER=admin
       - ADMIN_PASS=admin123
       - TZ=Asia/Jayapura
     volumes:
-      - /mnt/Main_Storage/Docker_NFS/Docker_VE/500_webapps_AudioAuto/app:/app/app
-      - /mnt/Main_Storage/Docker_NFS/Docker_VE/500_webapps_AudioAuto/audio_files:/app/audio_files
+      - ./app:/app/app
+      - ./audio_files:/app/audio_files
     depends_on:
       - db
+    networks:
+      - audioauto_net
 
+networks:
+  audioauto_net:
+    driver: bridge

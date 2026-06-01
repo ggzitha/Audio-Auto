@@ -1,114 +1,404 @@
 {% extends "base.html" %}
-
 {% block title %}Scheduler - Audio-Auto{% endblock %}
 
 {% block content %}
 <style>
-/* FullCalendar Google Calendar Dark Theme Override */
-.fc-theme-standard td, .fc-theme-standard th {
-    border-color: #374151 !important;
+/* FullCalendar dark theme */
+.fc-theme-standard td, .fc-theme-standard th { border-color: #374151 !important; }
+.fc .fc-toolbar-title { font-size: 1.2rem !important; font-weight: 700 !important; color: #f3f4f6 !important; }
+.fc-button-primary { background: transparent !important; border: 1px solid #4b5563 !important; color: #9ca3af !important; border-radius: 8px !important; }
+.fc-button-primary:hover { background: #374151 !important; color: #f3f4f6 !important; }
+.fc-button-active { background: #4b5563 !important; color: #fff !important; }
+.fc-daygrid-day-number { color: #9ca3af !important; }
+.fc-day-today { background: rgba(59,130,246,0.1) !important; }
+.fc-event { border-radius: 6px !important; border: none !important; font-size: 0.72rem !important; }
+
+/* Radial Clock Picker */
+.clock-picker-panel {
+    background: #1e293b;
+    border-radius: 20px;
+    padding: 20px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+    min-width: 300px;
+    max-width: 340px;
 }
-.fc .fc-toolbar-title {
-    font-size: 1.5rem !important;
-    font-weight: 700 !important;
-    color: #f3f4f6 !important;
-}
-.fc-button-primary {
-    background-color: transparent !important;
-    border: 1px solid #4b5563 !important;
-    color: #9ca3af !important;
-    text-transform: capitalize !important;
-    border-radius: 8px !important;
-}
-.fc-button-primary:hover {
-    background-color: #374151 !important;
-    color: #f3f4f6 !important;
-}
-.fc-button-active {
-    background-color: #4b5563 !important;
-    color: #fff !important;
-}
-.fc-daygrid-day-number {
-    color: #9ca3af !important;
-    font-weight: 500;
-}
-.fc-day-today {
-    background-color: rgba(59, 130, 246, 0.1) !important;
-}
-.fc-day-today .fc-daygrid-day-number {
-    background-color: #3b82f6;
-    color: #fff !important;
-    border-radius: 50%;
-    width: 28px;
-    height: 28px;
-    display: inline-flex;
+.clock-display {
+    display: flex;
     align-items: center;
     justify-content: center;
-    margin: 4px;
+    gap: 4px;
+    font-size: 2.8rem;
+    font-weight: 700;
+    font-family: 'Courier New', monospace;
+    margin-bottom: 16px;
+    color: #f1f5f9;
+    letter-spacing: 2px;
 }
-.fc-event {
-    border-radius: 4px !important;
-    border: none !important;
-    font-size: 0.75rem !important;
-    padding: 2px 4px !important;
-    cursor: pointer !important;
+.clock-display .seg {
+    padding: 4px 10px;
+    border-radius: 10px;
+    cursor: pointer;
+    transition: background 0.15s;
+    color: #94a3b8;
 }
+.clock-display .seg.active {
+    background: rgba(59,130,246,0.25);
+    color: #3b82f6;
+}
+.clock-sep { color: #475569; font-size: 2.2rem; line-height: 1; padding-bottom: 4px; }
+
+.clock-face-wrap {
+    position: relative;
+    width: 220px; height: 220px;
+    margin: 0 auto 16px;
+}
+.clock-svg {
+    width: 220px; height: 220px;
+}
+.clock-num-btn {
+    position: absolute;
+    width: 34px; height: 34px;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; font-weight: 600;
+    cursor: pointer;
+    transform: translate(-50%, -50%);
+    transition: background 0.15s, color 0.15s;
+    color: #cbd5e1;
+    z-index: 3;
+    user-select: none;
+}
+.clock-num-btn:hover { background: rgba(59,130,246,0.25); color: #3b82f6; }
+.clock-num-btn.selected { background: #3b82f6 !important; color: #fff !important; }
 </style>
 
-<div class="max-w-6xl mx-auto bg-white dark:bg-[#1f2937] p-6 rounded-2xl shadow-xl" id="scheduler-view">
-    <div id="calendar" class="min-h-[600px]"></div>
+<div class="max-w-6xl mx-auto space-y-5" id="scheduler-view">
+    <div class="flex items-center justify-between">
+        <h2 class="text-2xl font-bold text-gray-900 dark:text-white">
+            <i class="fas fa-calendar-alt text-primary mr-2"></i>Scheduler
+        </h2>
+        <button onclick="window.openScheduleModal(null,null)"
+                class="bg-primary hover:bg-blue-600 text-white px-5 py-2 rounded-xl font-semibold flex items-center gap-2 transition-colors shadow-lg shadow-blue-500/20">
+            <i class="fas fa-plus"></i> Add Schedule
+        </button>
+    </div>
+
+    <!-- Calendar -->
+    <div class="bg-white dark:bg-[#1f2937] p-4 md:p-6 rounded-2xl shadow-xl">
+        <div id="calendar" class="min-h-[400px]"></div>
+    </div>
+
+    <!-- Schedule Table -->
+    <div class="bg-white dark:bg-[#1e293b] rounded-2xl shadow-xl overflow-hidden">
+        <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-800 font-semibold text-gray-700 dark:text-gray-300 flex items-center gap-2">
+            <i class="fas fa-list text-primary"></i> Active Schedules
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+                <thead>
+                    <tr class="bg-gray-50 dark:bg-gray-800/50 text-left text-xs text-gray-500 uppercase tracking-wider">
+                        <th class="py-3 px-4">Date / Time</th>
+                        <th class="py-3 px-4">Audio File</th>
+                        <th class="py-3 px-4">Target</th>
+                        <th class="py-3 px-4">Repeat</th>
+                        <th class="py-3 px-4 text-right">Action</th>
+                    </tr>
+                </thead>
+                <tbody id="scheduleTableBody">
+                    <tr><td colspan="5" class="py-4 text-center text-gray-500">Loading...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
 </div>
 
-<!-- Add Modal -->
-<div id="scheduleModal" class="fixed inset-0 bg-black/60 hidden z-50 flex items-center justify-center transition-opacity opacity-0">
-    <div class="bg-white dark:bg-[#2d3748] w-full max-w-md rounded-2xl p-6 shadow-2xl transform scale-95 transition-transform duration-300" id="scheduleModalContent">
-        
-        <div class="flex justify-between items-center mb-6 border-b border-gray-700 pb-4">
-            <h3 class="text-xl font-bold text-white">Add Schedule</h3>
-            <button onclick="closeScheduleModal()" class="text-gray-400 hover:text-white"><i class="fas fa-times text-xl"></i></button>
-        </div>
-        
-        <form id="scheduleForm" onsubmit="saveSchedule(event)">
-            <input type="hidden" id="schedId">
-            <input type="hidden" id="schedRecur" value="none">
-            
-            <div class="flex space-x-2 mb-6">
-                <button type="button" id="btnRecurNone" class="flex-1 py-1.5 rounded-full text-xs font-medium bg-primary text-white transition-colors" onclick="setRecur('none')">One Time</button>
-                <button type="button" id="btnRecurDaily" class="flex-1 py-1.5 rounded-full text-xs font-medium bg-[#1a202c] border border-gray-600 text-gray-300 hover:bg-gray-700 transition-colors" onclick="setRecur('daily')">Daily</button>
-                <button type="button" id="btnRecurWeekly" class="flex-1 py-1.5 rounded-full text-xs font-medium bg-[#1a202c] border border-gray-600 text-gray-300 hover:bg-gray-700 transition-colors" onclick="setRecur('weekly')">Weekly</button>
-                <button type="button" id="btnRecurMonthly" class="flex-1 py-1.5 rounded-full text-xs font-medium bg-[#1a202c] border border-gray-600 text-gray-300 hover:bg-gray-700 transition-colors" onclick="setRecur('monthly')">Monthly</button>
-            </div>
+<!-- ═══ Add/Edit Schedule Modal ═══ -->
+<div id="scheduleModal" class="fixed inset-0 bg-black/60 hidden z-[100] flex items-center justify-center p-4">
+    <div class="bg-white dark:bg-[#1e2840] w-full max-w-md rounded-2xl p-6 shadow-2xl">
 
+        <div class="flex justify-between items-center mb-5 pb-4 border-b border-gray-200 dark:border-gray-700">
+            <h3 class="text-xl font-bold text-gray-900 dark:text-white" id="modalTitle">Add Schedule</h3>
+            <button onclick="window.closeScheduleModal()" class="text-gray-400 hover:text-white p-1"><i class="fas fa-times text-xl"></i></button>
+        </div>
+
+        <!-- Repeat buttons -->
+        <div class="flex space-x-2 mb-5" id="repeatBtnGroup">
+            <button type="button" id="btnRepeat_none"    onclick="setSchedRepeat('none')"    class="flex-1 py-1.5 rounded-full text-xs font-medium bg-primary text-white">One-Time</button>
+            <button type="button" id="btnRepeat_daily"   onclick="setSchedRepeat('daily')"   class="flex-1 py-1.5 rounded-full text-xs font-medium bg-gray-700 text-gray-300 hover:bg-gray-600">Daily</button>
+            <button type="button" id="btnRepeat_weekly"  onclick="setSchedRepeat('weekly')"  class="flex-1 py-1.5 rounded-full text-xs font-medium bg-gray-700 text-gray-300 hover:bg-gray-600">Weekly</button>
+            <button type="button" id="btnRepeat_monthly" onclick="setSchedRepeat('monthly')" class="flex-1 py-1.5 rounded-full text-xs font-medium bg-gray-700 text-gray-300 hover:bg-gray-600">Monthly</button>
+        </div>
+        <input type="hidden" id="repeatSelect" value="none">
+        <input type="hidden" id="editingScheduleId" value="">
+
+        <form id="schedulerForm">
             <div class="space-y-4">
-                <div class="flex space-x-4">
+                <!-- Date & Time row -->
+                <div class="flex gap-3">
                     <div class="flex-1">
-                        <label class="block text-sm text-gray-400 mb-1">Date</label>
-                        <input type="date" id="schedDate" class="w-full bg-[#1a202c] border border-gray-600 rounded-lg px-3 py-2 text-white outline-none focus:border-primary dark:[color-scheme:dark]" required>
+                        <label class="block text-xs text-gray-500 dark:text-gray-400 mb-1">Date</label>
+                        <input type="date" id="dateSelect"
+                            class="w-full bg-gray-100 dark:bg-[#131b2e] border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 text-gray-900 dark:text-white outline-none focus:border-primary dark:[color-scheme:dark]"
+                            required>
                     </div>
                     <div class="flex-1">
-                        <label class="block text-sm text-gray-400 mb-1">Time (HH:MM:SS)</label>
-                        <input type="text" id="schedTime" class="w-full bg-[#1a202c] border border-gray-600 rounded-lg px-3 py-2 text-white outline-none focus:border-primary text-center" value="12:00:00" required>
+                        <label class="block text-xs text-gray-500 dark:text-gray-400 mb-1">Time</label>
+                        <!-- Radial clock trigger button -->
+                        <button type="button" id="timePickerTrigger"
+                            class="w-full bg-gray-100 dark:bg-[#131b2e] border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 text-gray-900 dark:text-white outline-none focus:border-primary font-mono text-center hover:border-primary transition-colors"
+                            onclick="openClockPicker()">
+                            <i class="fas fa-clock mr-1 text-primary text-xs"></i>
+                            <span id="timeDisplay">12:00:00</span>
+                        </button>
+                        <input type="hidden" id="timeSelect" value="12:00:00">
                     </div>
                 </div>
-                
+
+                <!-- Target Device -->
                 <div>
-                    <label class="block text-sm text-gray-400 mb-1">Target Device</label>
-                    <select id="schedDevice" class="w-full bg-[#1a202c] border border-gray-600 rounded-lg px-3 py-2 text-white outline-none focus:border-primary" required>
+                    <label class="block text-xs text-gray-500 dark:text-gray-400 mb-1">Target Device</label>
+                    <select id="targetDeviceSelect"
+                        class="w-full bg-gray-100 dark:bg-[#131b2e] border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 text-gray-900 dark:text-white outline-none focus:border-primary">
+                        <option value="all">All Devices</option>
                     </select>
                 </div>
-                
+
+                <!-- Audio File -->
                 <div>
-                    <label class="block text-sm text-gray-400 mb-1">Audio File</label>
-                    <select id="schedAudio" class="w-full bg-[#1a202c] border border-gray-600 rounded-lg px-3 py-2 text-white outline-none focus:border-primary" required>
+                    <label class="block text-xs text-gray-500 dark:text-gray-400 mb-1">Audio File</label>
+                    <select id="audioSelect"
+                        class="w-full bg-gray-100 dark:bg-[#131b2e] border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 text-gray-900 dark:text-white outline-none focus:border-primary">
                     </select>
                 </div>
-                
-                <div class="pt-4 flex justify-between">
-                    <button type="button" id="btnDeleteSched" onclick="deleteSchedule()" class="text-red-500 hover:bg-red-500/10 px-4 py-2 rounded-lg hidden">Delete</button>
-                    <button type="submit" class="bg-primary hover:bg-blue-600 text-white px-6 py-2 rounded-lg font-medium ml-auto">Save</button>
+
+                <!-- Volume -->
+                <div>
+                    <label class="block text-xs text-gray-500 dark:text-gray-400 mb-1">Volume: <span id="schedVolVal">70</span>%</label>
+                    <input type="range" id="scheduleVolumeSelect" min="0" max="100" value="70"
+                        class="w-full accent-primary cursor-pointer"
+                        oninput="document.getElementById('schedVolVal').textContent=this.value">
+                </div>
+
+                <!-- Submit -->
+                <div class="pt-1 flex justify-end">
+                    <button type="submit" class="bg-primary hover:bg-blue-600 text-white px-8 py-2.5 rounded-xl font-semibold transition-colors shadow-lg shadow-blue-500/20">
+                        <i class="fas fa-calendar-plus mr-2"></i>Save Schedule
+                    </button>
                 </div>
             </div>
         </form>
     </div>
 </div>
+
+<!-- ═══ Radial Clock Picker Modal ═══ -->
+<div id="clockPickerModal" class="fixed inset-0 bg-black/70 hidden z-[200] flex items-center justify-center p-4"
+     onclick="if(event.target===this) closeClockPicker(false)">
+    <div class="clock-picker-panel" onclick="event.stopPropagation()">
+
+        <!-- Digital display — click a segment to switch mode -->
+        <div class="clock-display" id="clockDisplay">
+            <span class="seg active" id="seg_hh" onclick="setClockMode('hh')">12</span>
+            <span class="clock-sep">:</span>
+            <span class="seg" id="seg_mm" onclick="setClockMode('mm')">00</span>
+            <span class="clock-sep">:</span>
+            <span class="seg" id="seg_ss" onclick="setClockMode('ss')">00</span>
+        </div>
+
+        <!-- Mode label -->
+        <div class="text-center text-xs text-gray-400 mb-3 font-medium uppercase tracking-widest" id="clockModeLabel">Hour</div>
+
+        <!-- Clock face -->
+        <div class="clock-face-wrap" id="clockFaceWrap">
+            <svg class="clock-svg" id="clockSvg" viewBox="0 0 220 220">
+                <circle cx="110" cy="110" r="95" fill="rgba(15,23,42,0.7)" stroke="#334155" stroke-width="1.5"/>
+                <line id="clockHandLine" x1="110" y1="110" x2="110" y2="30"
+                      stroke="#3b82f6" stroke-width="2" stroke-linecap="round"/>
+                <circle id="clockHandDot" cx="110" cy="30" r="10" fill="#3b82f6"/>
+                <circle cx="110" cy="110" r="4" fill="#3b82f6"/>
+            </svg>
+            <div id="clockNumbers"></div>
+        </div>
+
+        <!-- Action buttons -->
+        <div class="flex items-center justify-between mt-2">
+            <button onclick="closeClockPicker(false)" class="px-5 py-2 rounded-xl text-gray-400 hover:text-white text-sm font-medium transition-colors">Cancel</button>
+            <div class="flex gap-2">
+                <button onclick="clockPrev()" class="px-4 py-2 rounded-xl bg-gray-700 hover:bg-gray-600 text-white text-sm transition-colors"><i class="fas fa-arrow-left text-xs mr-1"></i>Back</button>
+                <button onclick="clockNext()" id="clockNextBtn" class="px-4 py-2 rounded-xl bg-primary hover:bg-blue-600 text-white text-sm font-medium transition-colors">Next<i class="fas fa-arrow-right text-xs ml-1"></i></button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+// ══════════════════════════════════════════════════════════════════════════
+// Radial Clock Picker — precise seconds, 24-hour, drag + tap support
+// ══════════════════════════════════════════════════════════════════════════
+(function initClockPicker() {
+    var clockH = 12, clockM = 0, clockS = 0;
+    var clockMode = 'hh';
+    var MODES = ['hh','mm','ss'];
+    var MODE_LABELS = { hh:'Hour (0-23 · outer=AM · inner=PM)', mm:'Minute (drag or tap)', ss:'Second (drag or tap)' };
+    var isDragging = false;
+
+    function pad2(n) { return String(n).padStart(2,'0'); }
+    function getCur() { return clockMode==='hh' ? clockH : clockMode==='mm' ? clockM : clockS; }
+    function setCur(v) { if (clockMode==='hh') clockH=v; else if (clockMode==='mm') clockM=v; else clockS=v; }
+
+    window.openClockPicker = function() {
+        var t = (document.getElementById('timeSelect').value || '12:00:00').split(':');
+        clockH = parseInt(t[0])||0;
+        clockM = parseInt(t[1])||0;
+        clockS = parseInt(t[2])||0;
+        clockMode = 'hh';
+        refresh(); renderNums();
+        document.getElementById('clockPickerModal').classList.remove('hidden');
+        attachEvents();
+    };
+
+    window.closeClockPicker = function(apply) {
+        document.getElementById('clockPickerModal').classList.add('hidden');
+        if (apply) {
+            var val = pad2(clockH)+':'+pad2(clockM)+':'+pad2(clockS);
+            document.getElementById('timeSelect').value = val;
+            document.getElementById('timeDisplay').textContent = val;
+        }
+    };
+
+    window.setClockMode = function(m) { clockMode = m; refresh(); renderNums(); };
+
+    window.clockNext = function() {
+        var i = MODES.indexOf(clockMode);
+        if (i < MODES.length-1) { clockMode = MODES[i+1]; refresh(); renderNums(); }
+        else closeClockPicker(true);
+    };
+
+    window.clockPrev = function() {
+        var i = MODES.indexOf(clockMode);
+        if (i > 0) { clockMode = MODES[i-1]; refresh(); renderNums(); }
+    };
+
+    function getAngle(e, wrap) {
+        var r = wrap.getBoundingClientRect();
+        var ex = e.touches ? e.touches[0].clientX : e.clientX;
+        var ey = e.touches ? e.touches[0].clientY : e.clientY;
+        var angle = Math.atan2(ey-(r.top+r.height/2), ex-(r.left+r.width/2))*180/Math.PI + 90;
+        return angle < 0 ? angle+360 : angle;
+    }
+
+    function isInner(e, wrap) {
+        var r = wrap.getBoundingClientRect();
+        var ex = e.touches ? e.touches[0].clientX : e.clientX;
+        var ey = e.touches ? e.touches[0].clientY : e.clientY;
+        var dist = Math.sqrt(Math.pow(ex-(r.left+r.width/2),2)+Math.pow(ey-(r.top+r.height/2),2));
+        return dist < r.width * 0.35;
+    }
+
+    function handlePoint(e, wrap) {
+        var angle = getAngle(e, wrap);
+        if (clockMode === 'hh') {
+            var raw = Math.round(angle/360*12) % 12;
+            setCur(isInner(e, wrap) ? raw+12 : raw);
+        } else {
+            var v = Math.round(angle/360*60) % 60;
+            setCur(v < 0 ? v+60 : v);
+        }
+        refresh(); renderNums();
+    }
+
+    function attachEvents() {
+        var wrap = document.getElementById('clockFaceWrap');
+        if (!wrap || wrap._cpAttached) return;
+        wrap._cpAttached = true;
+        wrap.addEventListener('mousedown', function(e){ isDragging=true; handlePoint(e,wrap); });
+        wrap.addEventListener('mousemove', function(e){ if(isDragging){ e.preventDefault(); handlePoint(e,wrap); }});
+        document.addEventListener('mouseup',  function(){ if(!isDragging)return; isDragging=false; setTimeout(window.clockNext, 250); });
+        wrap.addEventListener('touchstart', function(e){ isDragging=true; handlePoint(e,wrap); }, {passive:true});
+        wrap.addEventListener('touchmove',  function(e){ if(isDragging){ e.preventDefault(); handlePoint(e,wrap); }}, {passive:false});
+        document.addEventListener('touchend', function(){ if(!isDragging)return; isDragging=false; setTimeout(window.clockNext, 250); });
+    }
+
+    function handXY(val) {
+        var max = clockMode==='hh'?12:60;
+        var frac = (clockMode==='hh'?(val%12):val)/max;
+        var ang = frac*360-90, rad=ang*Math.PI/180;
+        var r = (clockMode==='hh' && val>=12) ? 52 : 80;
+        return { x: 110+r*Math.cos(rad), y: 110+r*Math.sin(rad) };
+    }
+
+    function refresh() {
+        document.getElementById('seg_hh').textContent = pad2(clockH);
+        document.getElementById('seg_mm').textContent = pad2(clockM);
+        document.getElementById('seg_ss').textContent = pad2(clockS);
+        ['hh','mm','ss'].forEach(function(m){
+            var el = document.getElementById('seg_'+m);
+            if(el) el.classList.toggle('active', m===clockMode);
+        });
+        var lbl = document.getElementById('clockModeLabel');
+        if(lbl) lbl.textContent = MODE_LABELS[clockMode];
+
+        var p = handXY(getCur());
+        var line=document.getElementById('clockHandLine'), dot=document.getElementById('clockHandDot');
+        if(line){ line.setAttribute('x2',p.x); line.setAttribute('y2',p.y); }
+        if(dot){ dot.setAttribute('cx',p.x); dot.setAttribute('cy',p.y); }
+
+        var idx=MODES.indexOf(clockMode), btn=document.getElementById('clockNextBtn');
+        if(btn) btn.innerHTML = idx<MODES.length-1
+            ? 'Next <i class="fas fa-arrow-right text-xs ml-1"></i>'
+            : '<i class="fas fa-check text-xs mr-1"></i>Done';
+    }
+
+    function renderNums() {
+        var c = document.getElementById('clockNumbers');
+        if(!c) return;
+        c.innerHTML = '';
+        var cx=110, cy=110;
+        if(clockMode==='hh') {
+            for(var i=0;i<24;i++){
+                var inner=i>=12, frac=((i%12)/12);
+                var ang=frac*360-90, rad=ang*Math.PI/180, r=inner?52:80;
+                var btn=document.createElement('div');
+                btn.className='clock-num-btn';
+                btn.style.left=(cx+r*Math.cos(rad))+'px';
+                btn.style.top=(cy+r*Math.sin(rad))+'px';
+                btn.style.fontSize=inner?'10px':'13px';
+                btn.textContent=pad2(i);
+                if(i===clockH) btn.classList.add('selected');
+                (function(v){ btn.addEventListener('click',function(e){
+                    e.stopPropagation(); setCur(v); refresh(); renderNums();
+                    setTimeout(window.clockNext,300);
+                });})(i);
+                c.appendChild(btn);
+            }
+        } else {
+            var cur=getCur();
+            for(var i=0;i<12;i++){
+                var val=i*5, ang=(i/12)*360-90, rad=ang*Math.PI/180;
+                var btn=document.createElement('div');
+                btn.className='clock-num-btn';
+                btn.style.left=(cx+80*Math.cos(rad))+'px';
+                btn.style.top=(cy+80*Math.sin(rad))+'px';
+                btn.textContent=pad2(val);
+                if(Math.abs(cur-val)<3||(val===0&&cur>=57)) btn.classList.add('selected');
+                (function(v){ btn.addEventListener('click',function(e){
+                    e.stopPropagation(); setCur(v); refresh(); renderNums();
+                    setTimeout(window.clockNext,300);
+                });})(val);
+                c.appendChild(btn);
+            }
+            if(cur%5!==0){
+                var ang=(cur/60)*360-90, rad=ang*Math.PI/180;
+                var exact=document.createElement('div');
+                exact.className='clock-num-btn selected';
+                exact.style.left=(cx+80*Math.cos(rad))+'px';
+                exact.style.top=(cy+80*Math.sin(rad))+'px';
+                exact.style.fontSize='10px';
+                exact.textContent=pad2(cur);
+                c.appendChild(exact);
+            }
+        }
+    }
+})();
+// ══════════════════════════════════════════════════════════════════════════
+</script>
 {% endblock %}

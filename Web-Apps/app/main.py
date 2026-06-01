@@ -1,11 +1,46 @@
 import os
+import re
 import shutil
 import time
+import unicodedata
+from urllib.parse import quote
 from datetime import datetime
+try:
+    from zoneinfo import ZoneInfo          # Python 3.9+
+except ImportError:
+    from backports.zoneinfo import ZoneInfo # fallback
+
+_TZ_NAME = os.environ.get("TZ", "Asia/Jayapura")
+
+def _local_now():
+    """Current time as a naive datetime in the configured local timezone."""
+    return datetime.now(ZoneInfo(_TZ_NAME)).replace(tzinfo=None)
+
+def _parse_play_time(raw: str) -> datetime:
+    """
+    Parse the play_time string sent by the browser.
+    The browser now sends 'YYYY-MM-DDTHH:MM:SS' (no Z, no offset).
+    Old rows saved with a trailing Z are also handled.
+    Returns a naive datetime representing LOCAL time.
+    """
+    # Strip trailing Z or +00:00 — we treat the value as local time
+    clean = raw.rstrip('Z').split('+')[0].split('.')[0]
+    return datetime.fromisoformat(clean)
+
+def _tz_offset_str() -> str:
+    """Return the UTC offset as '+HH:MM' for the configured local timezone."""
+    import datetime as _dt
+    tz = ZoneInfo(_TZ_NAME)
+    offset = _dt.datetime.now(tz).utcoffset()
+    total_minutes = int(offset.total_seconds() / 60)
+    sign = '+' if total_minutes >= 0 else '-'
+    h, m = divmod(abs(total_minutes), 60)
+    return f"{sign}{h:02d}:{m:02d}"
+
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Request, Response, status, WebSocket, WebSocketDisconnect
 import json
 import asyncio
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
@@ -20,7 +55,60 @@ from starlette.middleware.sessions import SessionMiddleware
 from sqlalchemy.exc import OperationalError
 from . import models, database, mqtt_handler
 
-# Wait for DB to be ready
+
+# ─── Filename Sanitisation ────────────────────────────────────────────────────
+def sanitize_filename(original: str) -> str:
+    """
+    Convert any uploaded filename to a URL-safe ASCII string.
+
+    Steps:
+      1. Strip the extension, sanitise the stem.
+      2. Transliterate unicode → ASCII (e.g. é → e).
+      3. Keep only alphanumeric, space, dash, underscore, dot.
+      4. Collapse whitespace → single underscore.
+      5. Remove leading/trailing underscores and dashes.
+
+    Examples:
+      "01 It's All over but the crying.mp3"  → "01_Its_All_over_but_the_crying.mp3"
+      "Café au lait (live).flac"              → "Cafe_au_lait_live.flac"
+    """
+    # Split extension
+    name, _, ext = original.rpartition('.')
+    if not name:        # no dot found — treat whole string as name
+        name, ext = original, ''
+    else:
+        ext = '.' + ext.lower()
+
+    # Transliterate unicode → closest ASCII
+    name = unicodedata.normalize('NFKD', name)
+    name = name.encode('ascii', 'ignore').decode('ascii')
+
+    # Remove characters that are not alphanumeric, space, dash, underscore, dot
+    name = re.sub(r"[^\w\s\-.]", "", name)
+
+    # Collapse runs of whitespace/underscores → single underscore
+    name = re.sub(r"[\s_]+", "_", name)
+
+    # Strip leading/trailing underscores and dashes
+    name = name.strip('_-')
+
+    # Fallback if stem becomes empty
+    if not name:
+        name = "audio"
+
+    return name + ext
+
+
+def audio_url(server_host: str, filename: str) -> str:
+    """
+    Build a fully percent-encoded URL for an audio file.
+    The filename stored on disk may still contain spaces (legacy files),
+    so we always quote it here regardless.
+    """
+    encoded = quote(filename, safe='')
+    return f"http://{server_host}/audio_files/{encoded}"
+
+
 max_retries = 30
 for i in range(max_retries):
     try:
@@ -36,18 +124,34 @@ pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 class PlaybackState(BaseModel):
     audio_id: int | None = None
     is_playing: bool = False
-    position: float = 0.0
+    position: float = 0.0        # position snapshot at last_updated
     volume: int = 50
     speed: float = 1.0
-    last_updated: float = 0.0
+    last_updated: float = 0.0    # Unix timestamp when position was last set
+
 
 global_state = PlaybackState()
 
+
+def get_current_position() -> float:
+    """Calculate current playback position accounting for elapsed time."""
+    if not global_state.is_playing or global_state.last_updated == 0:
+        return global_state.position
+    elapsed = time.time() - global_state.last_updated
+    return global_state.position + elapsed * global_state.speed
+
+
 def broadcast_state():
     global main_loop
-    global_state.last_updated = time.time()
+    # Build a state dict that includes the real-time server_time so clients
+    # can calculate exact current position regardless of network latency.
+    state_dict = global_state.dict()
+    state_dict["server_time"] = time.time()  # current server unix timestamp
     if main_loop and main_loop.is_running():
-        asyncio.run_coroutine_threadsafe(manager.broadcast({"type": "state", "state": global_state.dict()}), main_loop)
+        asyncio.run_coroutine_threadsafe(
+            manager.broadcast({"type": "state", "state": state_dict}),
+            main_loop
+        )
 
 class ConnectionManager:
     def __init__(self):
@@ -75,7 +179,54 @@ app = FastAPI(title="Audio-Auto")
 app.add_middleware(SessionMiddleware, secret_key="super-secret-audio-auto-key-123")
 
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
-app.mount("/audio_files", StaticFiles(directory="audio_files"), name="audio_files")
+
+@app.get("/audio_files/{filename:path}")
+def get_audio_file(filename: str, request: Request):
+    # Strip directory traversal and decode any remaining percent-encoding
+    safe = os.path.basename(filename)
+    file_path = os.path.join("audio_files", safe)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    file_size = os.path.getsize(file_path)
+    range_header = request.headers.get("Range")
+
+    if not range_header:
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(file_size),
+            "Content-Type": "audio/mpeg"
+        }
+        return FileResponse(file_path, headers=headers, media_type="audio/mpeg")
+
+    range_match = range_header.replace("bytes=", "").split("-")
+    start = int(range_match[0]) if range_match[0] else 0
+    end = int(range_match[1]) if len(range_match) > 1 and range_match[1] else file_size - 1
+
+    if start >= file_size:
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
+
+    chunk_size = end - start + 1
+
+    def file_iterator():
+        with open(file_path, "rb") as f:
+            f.seek(start)
+            bytes_left = chunk_size
+            while bytes_left > 0:
+                chunk = f.read(min(bytes_left, 65536))
+                if not chunk:
+                    break
+                bytes_left -= len(chunk)
+                yield chunk
+
+    headers = {
+        "Content-Range": f"bytes {start}-{end}/{file_size}",
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(chunk_size),
+        "Content-Type": "audio/mpeg"
+    }
+
+    return StreamingResponse(file_iterator(), status_code=206, headers=headers)
 
 templates = Jinja2Templates(directory="app/templates")
 
@@ -100,28 +251,36 @@ def execute_schedule(schedule_id: int):
     if schedule and schedule.is_active:
         audio = schedule.audio
         if audio:
-            url = f"http://192.168.88.8:9876/audio_files/{audio.filename}"
+            url = audio_url("192.168.88.8:9876", audio.filename)
+            # Give 5s for all devices to receive and buffer
             start_time = int(time.time()) + 5
-            
+
             cmd = {
                 "action": "play",
                 "url": url,
                 "start_time": start_time,
-                "volume": schedule.volume
+                "volume": schedule.volume,
+                "position": 0.0
             }
             mqtt_handler.publish_command(schedule.device_name, cmd)
-            
+
+            # Update global state
+            global global_state
+            global_state.audio_id = audio.id
+            global_state.is_playing = True
+            global_state.position = 0.0
+            global_state.volume = schedule.volume
+            global_state.last_updated = float(start_time)  # will start counting from start_time
+
             if schedule.device_name in ["all", "Web App"]:
-                # Use asyncio.run safely by checking event loop
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        loop.create_task(manager.broadcast({"type": "play", "audio_id": audio.id, "volume": schedule.volume, "start_time": start_time}))
-                    else:
-                        asyncio.run(manager.broadcast({"type": "play", "audio_id": audio.id, "volume": schedule.volume, "start_time": start_time}))
-                except RuntimeError:
-                    asyncio.run(manager.broadcast({"type": "play", "audio_id": audio.id, "volume": schedule.volume, "start_time": start_time}))
-            
+                state_dict = global_state.dict()
+                state_dict["server_time"] = time.time()
+                if main_loop and main_loop.is_running():
+                    asyncio.run_coroutine_threadsafe(
+                        manager.broadcast({"type": "state", "state": state_dict}),
+                        main_loop
+                    )
+
             if schedule.repeat == "none":
                 schedule.is_active = False
                 db.commit()
@@ -129,12 +288,13 @@ def execute_schedule(schedule_id: int):
 
 def add_schedule_job(sch: models.Schedule):
     if sch.repeat == "none":
-        if sch.play_time > datetime.now():
+        if sch.play_time > _local_now():
             scheduler.add_job(
-                execute_schedule, 
-                trigger=DateTrigger(run_date=sch.play_time), 
+                execute_schedule,
+                trigger=DateTrigger(run_date=sch.play_time),
                 args=[sch.id],
-                id=f"sched_{sch.id}"
+                id=f"sched_{sch.id}",
+                replace_existing=True
             )
     else:
         hour = sch.play_time.hour
@@ -143,30 +303,28 @@ def add_schedule_job(sch: models.Schedule):
         if sch.repeat == "daily":
             trigger = CronTrigger(hour=hour, minute=minute, second=second)
         elif sch.repeat == "weekly":
-            day_of_week = sch.play_time.weekday() # 0-6 (Mon-Sun)
+            day_of_week = sch.play_time.weekday()  # 0-6 (Mon-Sun)
             trigger = CronTrigger(day_of_week=day_of_week, hour=hour, minute=minute, second=second)
         elif sch.repeat == "monthly":
             day = sch.play_time.day
             trigger = CronTrigger(day=day, hour=hour, minute=minute, second=second)
         else:
             return
-            
+
         scheduler.add_job(
             execute_schedule,
             trigger=trigger,
             args=[sch.id],
-            id=f"sched_{sch.id}"
+            id=f"sched_{sch.id}",
+            replace_existing=True
         )
 
 main_loop = None
 
 @app.on_event("startup")
-def startup_event():
+async def startup_event():
     global main_loop
-    try:
-        main_loop = asyncio.get_running_loop()
-    except RuntimeError:
-        pass
+    main_loop = asyncio.get_running_loop()
 
     # Attempt schema migrations safely
     db = database.SessionLocal()
@@ -207,16 +365,19 @@ def startup_event():
     def handle_mqtt_log(dev_name, log_text):
         global main_loop
         if main_loop and main_loop.is_running():
-            asyncio.run_coroutine_threadsafe(manager.broadcast({"type": "log", "device": dev_name, "text": log_text}), main_loop)
-    
+            asyncio.run_coroutine_threadsafe(
+                manager.broadcast({"type": "log", "device": dev_name, "text": log_text}),
+                main_loop
+            )
+
     mqtt_handler.on_log_callback = handle_mqtt_log
     mqtt_handler.start_mqtt()
     scheduler.start()
-    
+
     active_schedules = db.query(models.Schedule).filter(models.Schedule.is_active == True).all()
     for sch in active_schedules:
         add_schedule_job(sch)
-        
+
     db.close()
 
 @app.on_event("shutdown")
@@ -265,8 +426,12 @@ def read_help(request: Request, user=Depends(require_auth)):
 
 @app.get("/api/state")
 def get_global_state():
-    return global_state.dict()
-    
+    """Return current playback state with real-time position calculation."""
+    state_dict = global_state.dict()
+    state_dict["current_position"] = get_current_position()
+    state_dict["server_time"] = time.time()
+    return state_dict
+
 # --- API Routes ---
 @app.get("/api/devices")
 def get_devices(db: Session = Depends(database.get_db), user=Depends(require_auth)):
@@ -279,19 +444,19 @@ def delete_file(file_id: int, db: Session = Depends(database.get_db), user=Depen
     audio_file = db.query(models.AudioFile).filter(models.AudioFile.id == file_id).first()
     if not audio_file:
         raise HTTPException(status_code=404, detail="File not found")
-        
+
     # Delete file from disk
     file_path = os.path.join("audio_files", audio_file.filename)
     if os.path.exists(file_path):
         os.remove(file_path)
-        
+
     # Delete related schedules
     db.query(models.Schedule).filter(models.Schedule.audio_id == file_id).delete()
-    
+
     # Delete DB record
     db.delete(audio_file)
     db.commit()
-    
+
     return {"status": "ok"}
 
 @app.get("/api/files")
@@ -302,16 +467,19 @@ def get_files(db: Session = Depends(database.get_db), user=Depends(require_auth)
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...), db: Session = Depends(database.get_db), user=Depends(require_auth)):
     allowed_extensions = ["mp3", "wav", "flac", "aac", "ogg"]
-    ext = file.filename.split(".")[-1].lower()
+    ext = file.filename.rsplit(".", 1)[-1].lower() if '.' in file.filename else ''
     if ext not in allowed_extensions:
         raise HTTPException(status_code=400, detail="Invalid file type")
-    
-    filename = f"{int(time.time())}_{file.filename}"
+
+    # Sanitise filename: make it URL-safe BEFORE saving to disk
+    safe_name = sanitize_filename(file.filename)
+    filename = f"{int(time.time())}_{safe_name}"
     file_path = os.path.join("audio_files", filename)
-    
+
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-        
+
+    # Store original_name for display, sanitised filename for serving
     audio = models.AudioFile(filename=filename, original_name=file.filename)
     db.add(audio)
     db.commit()
@@ -325,14 +493,16 @@ class ScheduleRequest(BaseModel):
     repeat: str = "none"
     volume: int = 50
 
+# POST /api/schedules (canonical) and alias /api/schedule (for backward compat with old spa.js calls)
 @app.post("/api/schedules")
+@app.post("/api/schedule")
 def add_schedule(
     sched: ScheduleRequest,
     db: Session = Depends(database.get_db),
     user=Depends(require_auth)
 ):
     try:
-        dt = datetime.fromisoformat(sched.play_time)
+        dt = _parse_play_time(sched.play_time)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format")
 
@@ -346,7 +516,7 @@ def add_schedule(
     db.add(new_sched)
     db.commit()
     db.refresh(new_sched)
-    
+
     add_schedule_job(new_sched)
     return {"message": "Schedule added", "id": new_sched.id}
 
@@ -360,7 +530,8 @@ def get_schedules(db: Session = Depends(database.get_db), user=Depends(require_a
             "device_name": s.device_name,
             "audio_name": s.audio.original_name if s.audio else "Unknown",
             "audio_id": s.audio_id,
-            "play_time": s.play_time.isoformat(),
+            # Append the local UTC offset so browser new Date() interprets as local time
+            "play_time": s.play_time.isoformat() + _tz_offset_str(),
             "repeat": s.repeat,
             "volume": s.volume,
             "is_active": s.is_active
@@ -373,7 +544,7 @@ def update_schedule(schedule_id: int, sched: ScheduleRequest, db: Session = Depe
     if not existing:
         raise HTTPException(status_code=404, detail="Not found")
     try:
-        dt = datetime.fromisoformat(sched.play_time)
+        dt = _parse_play_time(sched.play_time)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format")
 
@@ -383,7 +554,7 @@ def update_schedule(schedule_id: int, sched: ScheduleRequest, db: Session = Depe
     existing.repeat = sched.repeat
     existing.volume = sched.volume
     db.commit()
-    
+
     try:
         scheduler.remove_job(f"sched_{existing.id}")
     except Exception:
@@ -405,14 +576,22 @@ def delete_schedule(schedule_id: int, db: Session = Depends(database.get_db), us
     raise HTTPException(status_code=404, detail="Not found")
 
 @app.post("/api/play")
-def realtime_play(device_name: str = Form("all"), audio_id: int = Form(...), volume: int = Form(50), position: float = Form(0.0), db: Session = Depends(database.get_db), user=Depends(require_auth)):
+def realtime_play(
+    device_name: str = Form("all"),
+    audio_id: int = Form(...),
+    volume: int = Form(50),
+    position: float = Form(0.0),
+    db: Session = Depends(database.get_db),
+    user=Depends(require_auth)
+):
     audio = db.query(models.AudioFile).filter(models.AudioFile.id == audio_id).first()
     if not audio:
         raise HTTPException(status_code=404, detail="Audio not found")
-        
-    url = f"http://192.168.88.8:9876/audio_files/{audio.filename}"
-    start_time = int(time.time()) + 2 
-    
+
+    url = audio_url("192.168.88.8:9876", audio.filename)
+    # Give 2 seconds for all listeners to receive the command and buffer
+    start_time = int(time.time()) + 2
+
     cmd = {
         "action": "play",
         "url": url,
@@ -426,34 +605,44 @@ def realtime_play(device_name: str = Form("all"), audio_id: int = Form(...), vol
     global_state.is_playing = True
     global_state.position = position
     global_state.volume = volume
+    # Set last_updated to start_time so position counting begins correctly
+    global_state.last_updated = float(start_time)
+
     broadcast_state()
-    
     mqtt_handler.publish_command(device_name, cmd)
-    return {"message": "Play command sent"}
+    return {"message": "Play command sent", "start_time": start_time}
 
 @app.post("/api/stop")
 def realtime_stop(device_name: str = Form("all"), user=Depends(require_auth)):
     cmd = {"action": "stop"}
 
     global global_state
+    # Snapshot the current position before pausing
+    global_state.position = get_current_position()
     global_state.is_playing = False
+    global_state.last_updated = time.time()
+
     broadcast_state()
-    
     mqtt_handler.publish_command(device_name, cmd)
     return {"message": "Stop command sent"}
 
 @app.post("/api/seek")
 def realtime_seek(device_name: str = Form("all"), position: float = Form(...), user=Depends(require_auth)):
+    # 300ms sync window: enough for MQTT to reach all ESP32s before they seek,
+    # but imperceptible to the human ear (vs. 1s which is very noticeable).
+    sync_delay = 0.3
+    start_time = time.time() + sync_delay
     cmd = {
         "action": "seek",
         "position": position,
-        "start_time": int(time.time()) + 2
+        "start_time": start_time
     }
 
     global global_state
     global_state.position = position
+    global_state.last_updated = start_time
+
     broadcast_state()
-    
     mqtt_handler.publish_command(device_name, cmd)
     return {"message": "Seek command sent"}
 
@@ -465,15 +654,37 @@ def realtime_speed(device_name: str = Form("all"), speed: float = Form(1.0), use
     }
 
     global global_state
+    # Snapshot current position before changing speed
+    global_state.position = get_current_position()
+    global_state.last_updated = time.time()
     global_state.speed = speed
+
     broadcast_state()
-    
     mqtt_handler.publish_command(device_name, cmd)
     return {"message": "Speed command sent"}
+
+@app.post("/api/volume")
+def realtime_volume(device_name: str = Form("all"), volume: int = Form(50), user=Depends(require_auth)):
+    cmd = {"action": "volume", "volume": volume}
+
+    global global_state
+    global_state.volume = volume
+
+    broadcast_state()
+    mqtt_handler.publish_command(device_name, cmd)
+    return {"status": "ok"}
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
+    # Send current state immediately on connect so new clients sync instantly
+    try:
+        state_dict = global_state.dict()
+        state_dict["current_position"] = get_current_position()
+        state_dict["server_time"] = time.time()
+        await websocket.send_json({"type": "state", "state": state_dict})
+    except Exception:
+        pass
     try:
         while True:
             data = await websocket.receive_text()
@@ -492,7 +703,7 @@ async def update_config(request: Request, db: Session = Depends(database.get_db)
     if not conf:
         conf = models.SystemConfig()
         db.add(conf)
-    
+
     conf.default_volume = int(form.get("default_volume", 50))
     conf.timezone = form.get("timezone", "UTC")
     conf.language = form.get("language", "en")
@@ -502,14 +713,4 @@ async def update_config(request: Request, db: Session = Depends(database.get_db)
 @app.post("/api/sync_time")
 def sync_time(db: Session = Depends(database.get_db), user=Depends(require_auth)):
     mqtt_handler.publish_command("all", {"action": "sync_time"})
-    return {"status": "ok"}
-
-@app.post("/api/volume")
-async def update_volume(device_name: str = Form(...), volume: int = Form(...)):
-    mqtt_handler.publish_command(device_name, {"action": "volume", "volume": volume})
-    return {"status": "ok"}
-
-@app.post("/api/speed")
-async def update_speed(device_name: str = Form(...), speed: float = Form(...)):
-    mqtt_handler.publish_command(device_name, {"action": "speed", "speed": speed})
     return {"status": "ok"}

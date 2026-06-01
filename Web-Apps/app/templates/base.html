@@ -2,133 +2,220 @@
 <html lang="en" class="dark">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
     <title>Audio-Auto</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
             darkMode: 'class',
-            theme: { extend: { colors: { primary: '#3b82f6', secondary: '#1e40af', darkbg: '#0f172a', darkcard: '#1e293b' } } }
+            theme: {
+                extend: {
+                    colors: {
+                        primary: '#3b82f6',
+                        secondary: '#1e40af',
+                        darkbg: '#0f172a',
+                        darkcard: '#1e293b'
+                    }
+                }
+            }
         }
     </script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
-    <link rel="stylesheet" type="text/css" href="https://npmcdn.com/flatpickr/dist/themes/dark.css">
-    <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
-    <!-- Add FullCalendar global for scheduler -->
     <script src='https://cdn.jsdelivr.net/npm/fullcalendar@6.1.11/index.global.min.js'></script>
+    <!-- WaveSurfer MUST be loaded before spa.js -->
+    <script src="https://unpkg.com/wavesurfer.js@7/dist/wavesurfer.min.js"></script>
     <style>
-        .glass { background: rgba(255, 255, 255, 0.05); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.1); }
-        .dark .glass { background: rgba(30, 41, 59, 0.7); }
-        ::-webkit-scrollbar { width: 8px; }
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 6px; }
         ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
         ::-webkit-scrollbar-thumb:hover { background: #6b7280; }
-        
+
+        /* Glass card */
+        .glass {
+            background: rgba(255,255,255,0.05);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .dark .glass { background: rgba(30,41,59,0.7); }
+
+        /* Sidebar: hidden on mobile by default, drawer when .mobile-open */
+        #sidebar {
+            position: fixed;
+            top: 0; left: 0;
+            height: 100%;
+            width: 260px;
+            z-index: 60;
+            transform: translateX(-100%);
+            transition: transform 0.28s cubic-bezier(.4,0,.2,1);
+            display: flex;
+            flex-direction: column;
+        }
+        #sidebar.mobile-open {
+            transform: translateX(0);
+        }
+        /* On md+ screens, sidebar is always visible in normal flow */
+        @media (min-width: 768px) {
+            #sidebar {
+                position: sticky;
+                top: 0;
+                transform: none !important;
+                height: 100vh;
+                flex-shrink: 0;
+            }
+            #mobileOverlay { display: none !important; }
+        }
+
+        /* Bottom player */
         #bottom-player {
             position: fixed;
-            bottom: 0;
-            left: 0;
+            bottom: 0; left: 0;
             width: 100%;
-            height: 72px;
+            height: 68px;
             z-index: 50;
+        }
+
+        /* Radial Clock Picker */
+        .clock-picker-overlay {
+            position: fixed; inset: 0;
+            background: rgba(0,0,0,0.7);
+            z-index: 9998;
+            display: flex; align-items: center; justify-content: center;
+        }
+        .clock-face {
+            background: #1e293b;
+            border-radius: 50%;
+            position: relative;
+            cursor: pointer;
+            user-select: none;
+        }
+        .clock-hand {
+            position: absolute;
+            bottom: 50%; left: 50%;
+            transform-origin: bottom center;
+            pointer-events: none;
+        }
+        .clock-center-dot {
+            position: absolute;
+            width: 10px; height: 10px;
+            background: #3b82f6;
+            border-radius: 50%;
+            top: 50%; left: 50%;
+            transform: translate(-50%,-50%);
+            pointer-events: none;
+            z-index: 5;
+        }
+        .clock-number {
+            position: absolute;
+            width: 32px; height: 32px;
+            border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 13px; font-weight: 600;
+            cursor: pointer;
+            transform: translate(-50%,-50%);
+            transition: background 0.15s;
+            z-index: 3;
+        }
+        .clock-number:hover { background: rgba(59,130,246,0.3); }
+        .clock-number.selected {
+            background: #3b82f6 !important;
+            color: white !important;
         }
     </style>
 </head>
-<!-- No overflow-hidden on body to allow normal scrolling when needed, flex-col for mobile, flex-row for desktop -->
-<body class="bg-gray-50 dark:bg-darkbg text-gray-900 dark:text-gray-100 transition-colors duration-300 min-h-screen flex flex-col md:flex-row">
+
+<body class="bg-gray-50 dark:bg-darkbg text-gray-900 dark:text-gray-100 transition-colors duration-300 min-h-screen flex flex-row">
 
     {% if request.session.get('user_id') %}
+    <!-- Mobile overlay backdrop -->
+    <div id="mobileOverlay" class="hidden fixed inset-0 bg-black/60 z-50 md:hidden"></div>
+
     <!-- Sidebar -->
-    <!-- h-screen sticky top-0 ensures it stays full height and doesn't scroll away -->
-    <aside class="w-64 bg-white dark:bg-darkcard border-r border-gray-200 dark:border-gray-800 hidden md:flex flex-col shadow-lg z-20 h-screen sticky top-0">
+    <aside id="sidebar" class="bg-white dark:bg-darkcard border-r border-gray-200 dark:border-gray-800 shadow-2xl">
         <div class="h-16 flex items-center px-6 border-b border-gray-200 dark:border-gray-800 shrink-0">
             <i class="fas fa-wave-square text-primary text-2xl mr-3"></i>
             <h1 class="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-purple-500">Audio-Auto</h1>
         </div>
-        <!-- overflow-y-auto allows the links to scroll if they exceed height, but keeps logout at bottom -->
-        <nav class="flex-1 overflow-y-auto px-4 py-6 space-y-2">
-            <a href="/" class="spa-link flex items-center px-4 py-3 text-gray-700 dark:text-gray-300 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-xl transition-all"><i class="fas fa-play-circle w-6 text-center"></i> <span class="ml-3" data-i18n="dashboard">Dashboard</span></a>
-            <a href="/scheduler" class="spa-link flex items-center px-4 py-3 text-gray-700 dark:text-gray-300 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-xl transition-all"><i class="fas fa-calendar-alt w-6 text-center"></i> <span class="ml-3" data-i18n="scheduler">Scheduler</span></a>
-            <a href="/devices" class="spa-link flex items-center px-4 py-3 text-gray-700 dark:text-gray-300 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-xl transition-all"><i class="fas fa-microchip w-6 text-center"></i> <span class="ml-3" data-i18n="devices">Devices</span></a>
-            <a href="/config" class="spa-link flex items-center px-4 py-3 text-gray-700 dark:text-gray-300 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-xl transition-all"><i class="fas fa-cog w-6 text-center"></i> <span class="ml-3" data-i18n="config">Configuration</span></a>
-            <a href="/help" class="spa-link flex items-center px-4 py-3 text-gray-700 dark:text-gray-300 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-xl transition-all"><i class="fas fa-question-circle w-6 text-center"></i> <span class="ml-3" data-i18n="help">Help</span></a>
+        <nav class="flex-1 overflow-y-auto px-4 py-6 space-y-1">
+            <a href="/" class="spa-link flex items-center px-4 py-3 text-gray-700 dark:text-gray-300 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-xl transition-all gap-3"><i class="fas fa-play-circle w-5 text-center text-blue-400"></i><span data-i18n="dashboard">Dashboard</span></a>
+            <a href="/scheduler" class="spa-link flex items-center px-4 py-3 text-gray-700 dark:text-gray-300 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-xl transition-all gap-3"><i class="fas fa-calendar-alt w-5 text-center text-purple-400"></i><span data-i18n="scheduler">Scheduler</span></a>
+            <a href="/devices" class="spa-link flex items-center px-4 py-3 text-gray-700 dark:text-gray-300 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-xl transition-all gap-3"><i class="fas fa-microchip w-5 text-center text-green-400"></i><span data-i18n="devices">Devices</span></a>
+            <a href="/config" class="spa-link flex items-center px-4 py-3 text-gray-700 dark:text-gray-300 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-xl transition-all gap-3"><i class="fas fa-cog w-5 text-center text-yellow-400"></i><span data-i18n="config">Configuration</span></a>
+            <a href="/help" class="spa-link flex items-center px-4 py-3 text-gray-700 dark:text-gray-300 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-xl transition-all gap-3"><i class="fas fa-question-circle w-5 text-center text-pink-400"></i><span data-i18n="help">Help</span></a>
         </nav>
-        
-        <!-- Bottom elements of sidebar -->
-        <div class="px-4 pb-4 shrink-0">
-            <a href="/logout" class="flex items-center px-4 py-3 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-xl transition-all"><i class="fas fa-sign-out-alt w-6 text-center"></i> <span class="ml-3">Logout</span></a>
+        <div class="px-4 pb-2 shrink-0">
+            <a href="/logout" class="flex items-center px-4 py-3 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-xl transition-all gap-3"><i class="fas fa-sign-out-alt w-5 text-center"></i><span>Logout</span></a>
         </div>
-        <div class="p-4 border-t border-gray-200 dark:border-gray-800 flex justify-between items-center shrink-0" style="padding-bottom: 84px;">
-            <button id="themeToggle" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors">
-                <i class="fas fa-moon dark:hidden"></i>
+        <div class="p-4 border-t border-gray-200 dark:border-gray-800 flex justify-between items-center shrink-0" style="padding-bottom:84px;">
+            <button id="themeToggle" class="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors" title="Toggle theme">
+                <i class="fas fa-moon dark:hidden text-gray-600"></i>
                 <i class="fas fa-sun hidden dark:block text-yellow-400"></i>
             </button>
-            <button id="langToggle" class="px-3 py-1 font-semibold rounded-md bg-gray-200 dark:bg-gray-700 hover:bg-primary hover:text-white transition-colors">EN</button>
+            <button id="langToggle" class="px-3 py-1 font-semibold rounded-md bg-gray-200 dark:bg-gray-700 hover:bg-primary hover:text-white transition-colors text-sm">EN</button>
         </div>
     </aside>
     {% endif %}
 
     <!-- Main Content -->
-    <main class="flex-1 flex flex-col min-w-0" id="main-scroll-area">
+    <main class="flex-1 flex flex-col min-w-0 overflow-x-hidden">
         {% if request.session.get('user_id') %}
-        <!-- Header (Mobile) -->
-        <header class="h-16 shrink-0 bg-white dark:bg-darkcard border-b border-gray-200 dark:border-gray-800 flex items-center justify-between px-4 md:hidden shadow-sm">
-            <div class="flex items-center">
-                <i class="fas fa-wave-square text-primary text-xl mr-2"></i>
-                <h1 class="text-lg font-bold">Audio-Auto</h1>
+        <!-- Mobile Header -->
+        <header class="h-14 shrink-0 bg-white dark:bg-darkcard border-b border-gray-200 dark:border-gray-800 flex items-center justify-between px-4 md:hidden shadow-sm sticky top-0 z-40">
+            <div class="flex items-center gap-2">
+                <i class="fas fa-wave-square text-primary text-xl"></i>
+                <span class="text-base font-bold">Audio-Auto</span>
             </div>
-            <button id="mobileMenuBtn" class="p-2 text-gray-600 dark:text-gray-300">
+            <button id="mobileMenuBtn" class="p-2 text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors">
                 <i class="fas fa-bars text-xl"></i>
             </button>
         </header>
         {% endif %}
 
-        <!-- content area with bottom padding for the player -->
-        <div class="flex-1 p-4 md:p-8 relative" style="padding-bottom: 90px;">
+        <!-- Content area -->
+        <div class="flex-1 p-3 md:p-8 relative" style="padding-bottom:90px;">
             <div class="absolute inset-0 bg-gradient-to-br from-blue-500/5 to-purple-500/5 pointer-events-none z-[-1]"></div>
             <div class="max-w-7xl mx-auto w-full" id="spa-content">
                 {% block content %}{% endblock %}
             </div>
         </div>
-        
+
         {% if request.session.get('user_id') %}
-        <!-- Hidden Audio engine for playing across pages -->
-        <audio id="localAudio" class="hidden"></audio>
-        
-        <!-- Persistent Bottom Audio Player (Mini Player) -->
-        <!-- Hidden by default via class 'hidden' managed in JS -->
-        <div id="bottom-player" class="bg-white dark:bg-[#1a1a1a] border-t border-gray-200 dark:border-gray-800 shadow-[0_-10px_40px_rgba(0,0,0,0.5)] flex items-center px-4 justify-between text-sm hidden">
-            
-            <div class="flex items-center w-1/3 md:w-1/4">
-                <div class="w-10 h-10 md:w-12 md:h-12 rounded bg-gray-200 dark:bg-gray-700 flex items-center justify-center overflow-hidden shrink-0">
-                    <i class="fas fa-music text-gray-400 text-lg md:text-xl" id="miniCoverIcon"></i>
+        <!-- Persistent hidden audio engine -->
+        <audio id="localAudio" class="hidden" preload="auto"></audio>
+
+        <!-- Persistent Bottom Mini Player -->
+        <div id="bottom-player" class="bg-white dark:bg-[#1a1a1a] border-t border-gray-200 dark:border-gray-800 shadow-[0_-8px_32px_rgba(0,0,0,0.4)] flex items-center px-3 md:px-5 justify-between text-sm hidden">
+            <div class="flex items-center w-2/5 md:w-1/4 min-w-0">
+                <div class="w-10 h-10 rounded-lg bg-gradient-to-br from-blue-500/20 to-purple-500/20 flex items-center justify-center shrink-0">
+                    <i class="fas fa-music text-blue-400" id="miniCoverIcon"></i>
                 </div>
-                <div class="ml-3 truncate">
-                    <div id="miniSongTitle" class="font-bold text-gray-900 dark:text-white truncate text-xs md:text-sm">No media</div>
-                    <div id="miniDeviceText" class="text-[10px] md:text-xs text-gray-500">Audio-Auto</div>
+                <div class="ml-2 truncate min-w-0">
+                    <div id="miniSongTitle" class="font-semibold text-gray-900 dark:text-white truncate text-xs md:text-sm">No media</div>
+                    <div id="miniDeviceText" class="text-[10px] text-gray-500">Audio-Auto</div>
                 </div>
             </div>
-            
-            <div class="flex flex-col items-center justify-center w-1/3 md:w-1/2 max-w-2xl px-2">
-                <div class="flex items-center space-x-4 md:space-x-6 mb-1">
-                    <button id="miniBtnPrev" class="text-gray-400 hover:text-white transition"><i class="fas fa-step-backward"></i></button>
+
+            <div class="flex flex-col items-center w-1/5 md:w-1/2 max-w-xl">
+                <div class="flex items-center gap-3 md:gap-6 mb-1">
+                    <button id="miniBtnPrev" class="text-gray-400 hover:text-white transition p-1"><i class="fas fa-step-backward text-sm md:text-base"></i></button>
                     <button id="miniBtnPlay" class="text-white hover:text-primary transition"><i class="fas fa-play-circle text-2xl md:text-3xl" id="miniPlayIcon"></i></button>
-                    <button id="miniBtnNext" class="text-gray-400 hover:text-white transition"><i class="fas fa-step-forward"></i></button>
+                    <button id="miniBtnNext" class="text-gray-400 hover:text-white transition p-1"><i class="fas fa-step-forward text-sm md:text-base"></i></button>
                 </div>
-                <div class="hidden md:flex items-center w-full space-x-3 text-xs text-gray-400">
+                <div class="hidden md:flex items-center w-full gap-3 text-xs text-gray-400">
                     <span id="miniTimeElapsed">0:00</span>
-                    <div class="h-1 flex-1 bg-gray-600 rounded-full relative cursor-pointer group" id="miniProgressBarContainer">
-                        <div id="miniProgressOverlay" class="absolute top-0 left-0 h-full bg-primary rounded-full" style="width: 0%;"></div>
+                    <div class="h-1 flex-1 bg-gray-600 rounded-full relative cursor-pointer" id="miniProgressBarContainer">
+                        <div id="miniProgressOverlay" class="absolute top-0 left-0 h-full bg-primary rounded-full transition-all" style="width:0%"></div>
                     </div>
                     <span id="miniTimeTotal">0:00</span>
                 </div>
             </div>
-            
-            <div class="flex items-center justify-end w-1/3 md:w-1/4 space-x-2 md:space-x-4">
-                <i class="fas fa-volume-up text-gray-400 hidden md:block"></i>
-                <input type="range" id="miniVolSlider" min="0" max="100" value="50" class="w-16 md:w-24 h-1 bg-gray-600 rounded-full appearance-none accent-primary hidden md:block cursor-pointer">
+
+            <div class="flex items-center justify-end w-2/5 md:w-1/4 gap-2 md:gap-4">
+                <i class="fas fa-volume-up text-gray-400 hidden md:block text-sm"></i>
+                <input type="range" id="miniVolSlider" min="0" max="100" value="50"
+                       class="w-14 md:w-24 h-1 bg-gray-600 rounded-full appearance-none accent-primary hidden md:block cursor-pointer">
             </div>
         </div>
         {% endif %}
@@ -140,7 +227,5 @@
     <script src="/static/spa.js?v={{ cache_buster }}"></script>
     {% endif %}
     {% block scripts %}{% endblock %}
-
-    <script src="https://unpkg.com/wavesurfer.js@7/dist/wavesurfer.min.js"></script>
 </body>
 </html>

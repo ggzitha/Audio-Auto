@@ -41,7 +41,9 @@ Because you are using a mix of ESP32s, the wiring depends heavily on the board t
 
 #### Option A: Classic ESP32 (Internal DAC - No Extra Hardware)
 This is the simplest wiring but produces lower audio quality (8-bit). 
-- Connect an amplifier or headphones directly to `GPIO 25` (Left) or `GPIO 26` (Right).
+- Connect the Aux/Headphone **Left** channel to `GPIO 25`.
+- Connect the Aux/Headphone **Right** channel to `GPIO 26`.
+- Connect the Aux/Headphone **Ground** to any `GND` pin on the ESP32.
 - **Code Config:** Pass `true` or use internal DAC mode when initializing the `audioI2S` library.
 
 #### Option B: Classic ESP32 with External DAC (PCM5102A)
