@@ -1,28 +1,47 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║     Audio-Auto Client  —  ESP32 Classic (WROOM / WROVER)                 ║
- * ║     Library: ESP8266Audio by earlephilhower                               ║
- * ║                                                                           ║
- * ║  NOTE: ESP32-audioI2S v3.x requires PSRAM. This board has none.          ║
- * ║  ESP8266Audio was written for ESP8266 (80KB heap) — works perfectly       ║
- * ║  on ESP32 classic without PSRAM, and is proven to work on C3/C6 too.      ║
+ * ║     Audio-Auto Client  —  ESP32-C3 / ESP32-C6                           ║
+ * ║     Library: ESP8266Audio by earlephilhower                              ║
  * ╚══════════════════════════════════════════════════════════════════════════╝
  *
+ * WHY A DIFFERENT FIRMWARE?
+ *   ESP32-audioI2S v3.x uses xTaskCreatePinnedToCore() which requires 2 CPU
+ *   cores. ESP32-C3 and ESP32-C6 are single-core RISC-V — that library simply
+ *   won't compile for them. ESP8266Audio was originally written for the ESP8266
+ *   (also single-core) and works on C3/C6 without PSRAM.
+ *
  * ┌─────────────────────────────────────────────────────────────────────────┐
- * │  WIRING — PCM5102A  →  ESP32 Classic (WROOM / WROVER)                   │
+ * │  WIRING — PCM5102A  →  ESP32-C3                                         │
  * ├──────────────┬────────────┬─────────────────────────────────────────────┤
- * │  PCM5102A    │  ESP32     │  Notes                                       │
+ * │  PCM5102A    │  ESP32-C3  │  Notes                                       │
  * ├──────────────┼────────────┼─────────────────────────────────────────────┤
  * │  VCC         │  3.3V      │  Module also works on 5V                     │
  * │  GND         │  GND       │                                              │
- * │  BCK         │  GPIO 26   │  Bit Clock (BCLK)                           │
- * │  LCK / LRCK  │  GPIO 25   │  Word Select (Left-Right Clock)             │
- * │  DIN         │  GPIO 22   │  Serial Data                                │
+ * │  BCK         │  GPIO 5    │  Bit Clock (BCLK)                           │
+ * │  LCK / LRCK  │  GPIO 4    │  Word Select (Left-Right Clock)             │
+ * │  DIN         │  GPIO 6    │  Serial Data                                │
  * │  SCK / MCLK  │  GND       │  Tie to GND — no master clock needed        │
  * │  FMT         │  GND       │  I2S standard format                        │
  * │  XMT / XSMT  │  3.3V      │  Un-mute — MUST be HIGH or no sound!        │
- * ├──────────────┴────────────┴─────────────────────────────────────────────┤
- * │  AUDIO OUTPUT                                                            │
+ * └──────────────┴────────────┴─────────────────────────────────────────────┘
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │  WIRING — PCM5102A  →  ESP32-C6                                         │
+ * ├──────────────┬────────────┬─────────────────────────────────────────────┤
+ * │  PCM5102A    │  ESP32-C6  │  Notes                                       │
+ * ├──────────────┼────────────┼─────────────────────────────────────────────┤
+ * │  VCC         │  3.3V      │                                              │
+ * │  GND         │  GND       │                                              │
+ * │  BCK         │  GPIO 19   │  Bit Clock (BCLK)                           │
+ * │  LCK / LRCK  │  GPIO 18   │  Word Select                                │
+ * │  DIN         │  GPIO 20   │  Serial Data                                │
+ * │  SCK / MCLK  │  GND       │  Tie to GND                                 │
+ * │  FMT         │  GND       │  I2S standard format                        │
+ * │  XMT / XSMT  │  3.3V      │  Un-mute — MUST be HIGH!                    │
+ * └──────────────┴────────────┴─────────────────────────────────────────────┘
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │  AUDIO OUTPUT (both C3 and C6)                                           │
  * │  PCM5102A OUTL → AUX Left  (3.5mm Tip)                                 │
  * │  PCM5102A OUTR → AUX Right (3.5mm Ring)                                 │
  * │  PCM5102A GND  → AUX GND   (3.5mm Sleeve)                              │
@@ -37,16 +56,32 @@
  *
  * ┌─────────────────────────────────────────────────────────────────────────┐
  * │  BOARD SETTINGS (Arduino IDE → Tools)                                    │
- * │  Board     : "ESP32 Dev Module" (or your specific module)                │
- * │  CPU Freq  : 240 MHz                                                     │
- * │  PSRAM     : Disabled                                                    │
+ * │  ESP32-C3: Board = "ESP32C3 Dev Module"                                  │
+ * │            USB CDC On Boot = "Enabled" (for Serial Monitor)              │
+ * │  ESP32-C6: Board = "ESP32C6 Dev Module"                                  │
+ * │            USB CDC On Boot = "Enabled"                                   │
+ * │  CPU Freq : 160 MHz (recommended for audio decode)                       │
  * └─────────────────────────────────────────────────────────────────────────┘
  */
 
-// ── Compile-time guard ───────────────────────────────────────────────────────
-// This file is for ESP32 classic dual-core. C3/C6 → use Audio_Client_C3C6.
-#if defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32C6)
-  #error "Wrong firmware! ESP32-C3/C6 → use the Audio_Client_C3C6 folder instead."
+// ── Compile-time chip selection ──────────────────────────────────────────────
+#if defined(CONFIG_IDF_TARGET_ESP32C3)
+  #define CHIP_NAME "ESP32-C3"
+  #define I2S_BCLK  5
+  #define I2S_LRC   4
+  #define I2S_DOUT  6
+#elif defined(CONFIG_IDF_TARGET_ESP32C6)
+  #define CHIP_NAME "ESP32-C6"
+  #define I2S_BCLK  19
+  #define I2S_LRC   18
+  #define I2S_DOUT  20
+#else
+  // Fallback for compiling on any other ESP32 variant
+  #define CHIP_NAME "ESP32-Generic"
+  #define I2S_BCLK  26
+  #define I2S_LRC   25
+  #define I2S_DOUT  22
+  #warning "Audio_Client_C3C6 is intended for ESP32-C3/C6. For ESP32 classic use Audio_Client instead."
 #endif
 
 // ESP8266Audio headers
@@ -54,6 +89,7 @@
 #include <AudioFileSourceHTTPStream.h>
 #include <AudioFileSourceBuffer.h>
 #include <AudioOutputI2S.h>
+
 
 #include <WiFi.h>
 #include <WiFiMulti.h>
@@ -66,9 +102,9 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 // Unique name per device.
-// Format: ESP32-RoomCode-Number  (no spaces)
-// Examples: ESP32-Lobby-001, ESP32-Ruang-A001
-const char* DEVICE_NAME = "ESP32-Ruang-A001";
+// Format: ESP32c3-RoomCode-Number  or  ESP32c6-RoomCode-Number
+// Examples: ESP32c3-Hall-001, ESP32c6-Lobby-002
+const char* DEVICE_NAME = "ESP32c3-Ruang-B001";
 
 // WiFi — up to 3 networks, picks strongest automatically
 const char* WIFI_SSID1 = "DCLXVI";          const char* WIFI_PASS1 = "1029384756";
@@ -88,24 +124,20 @@ const char* NTP3 = "time.cloudflare.com";
 const long  TZ_OFFSET_SEC = 9 * 3600;
 const int   DST_OFFSET    = 0;
 
-// I2S GPIO pins for PCM5102A (see wiring table above)
-#define I2S_BCLK  26   // Bit Clock
-#define I2S_LRC   25   // Word Select (LRCK)
-#define I2S_DOUT  22   // Data Out
-
 // ═══════════════════════════════════════════════════════════════════════════
 
 WiFiMulti    wifiMulti;
 WiFiClient   netClient;
 PubSubClient mqtt(netClient);
 
-// ESP8266Audio objects (heap-allocated — recreated on each new track)
-AudioOutputI2S*            i2sOut = nullptr;
-AudioFileSourceHTTPStream* http   = nullptr;
-AudioFileSourceBuffer*     source = nullptr;
-AudioGeneratorMP3*         mp3    = nullptr;
+// ESP8266Audio objects (heap-allocated so we can delete/recreate on each play)
+AudioOutputI2S*           i2sOut  = nullptr;
+AudioFileSourceHTTPStream* http   = nullptr;   // raw HTTP stream
+AudioFileSourceBuffer*    source  = nullptr;   // 4 kB RAM buffer
+AudioGeneratorMP3*        mp3     = nullptr;
 
-// Playback state machine
+
+// Playback state
 enum AudioState { IDLE, WAITING_SYNC, PLAYING };
 AudioState   state           = IDLE;
 String       pendingUrl      = "";
@@ -113,16 +145,17 @@ double       syncStartTime   = 0;
 float        pendingPosition = 0.0f;
 int          currentVolume   = 80;   // 0–100 %
 
-unsigned long lastTelemetry = 0;
-unsigned long lastWifiCheck = 0;
-unsigned long ntpFallbackMs = 0;
+unsigned long lastTelemetry  = 0;
+unsigned long lastWifiCheck  = 0;
+unsigned long ntpFallbackMs  = 0;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 void logMsg(const String& msg) {
     Serial.println(msg);
-    if (mqtt.connected())
+    if (mqtt.connected()) {
         mqtt.publish(("audioauto/log/" + String(DEVICE_NAME)).c_str(), msg.c_str());
+    }
 }
 
 // ── Audio control ────────────────────────────────────────────────────────────
@@ -135,19 +168,22 @@ void stopAudio() {
     state = IDLE;
 }
 
+
 /**
- * Stream MP3 from HTTP URL.
- * seekSec — approximate position in seconds (byte-offset via Range header).
- * volPct  — 0–100.
+ * Start streaming MP3 from an HTTP URL.
+ * seekSec — approximate position in seconds.
+ *   ESP8266Audio's AudioFileSourceHTTPStream::seek() internally re-issues the
+ *   HTTP request with a Range header on ESP32 builds, so this works correctly.
+ * volPct  — 0–100 volume
  */
 void startStream(const String& url, float seekSec, int volPct) {
     stopAudio();
+
     Serial.printf("[Stream] %s  pos=%.1fs  vol=%d%%\n",
                   url.c_str(), seekSec, volPct);
 
     // Create I2S output once; reuse across tracks
     if (!i2sOut) {
-        // AudioOutputI2S(port=0, mode=EXTERNAL_I2S)
         i2sOut = new AudioOutputI2S(0, AudioOutputI2S::EXTERNAL_I2S);
         i2sOut->SetPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
     }
@@ -162,21 +198,22 @@ void startStream(const String& url, float seekSec, int volPct) {
         return;
     }
 
-    // Approximate seek — byte offset at ~128 kbps = 16 000 B/s
-    // seek() re-issues the HTTP request with Range: bytes=N-
+    // Approximate seek via byte offset (128 kbps = 16 000 B/s)
+    // seek() on ESP32 AudioFileSourceHTTPStream re-opens with Range: bytes=N-
     if (seekSec > 1.0f) {
         uint32_t byteOffset = (uint32_t)(seekSec * 16000.0f);
         if (!http->seek(byteOffset, SEEK_SET)) {
-            Serial.printf("[Stream] seek unsupported, drift %.1fs\n", seekSec);
+            // seek not supported on this build — play from start, accept drift
+            Serial.printf("[Stream] seek unsupported, playing from 0 (drift %.1fs)\n", seekSec);
         }
     }
 
-    // 8 KB buffer — smooths WiFi jitter on dual-core ESP32
-    source = new AudioFileSourceBuffer(http, 8192);
+    // 4 kB RAM buffer to smooth out WiFi jitter
+    source = new AudioFileSourceBuffer(http, 4096);
 
     mp3 = new AudioGeneratorMP3();
     if (!mp3->begin(source, i2sOut)) {
-        logMsg("ERROR: MP3 decoder failed");
+        logMsg("ERROR: MP3 decoder failed to start");
         stopAudio();
         return;
     }
@@ -184,6 +221,7 @@ void startStream(const String& url, float seekSec, int volPct) {
     state = PLAYING;
     logMsg("Playing: " + url);
 }
+
 
 // ── NTP ─────────────────────────────────────────────────────────────────────
 
@@ -215,7 +253,7 @@ void registerDevice() {
     doc["name"] = DEVICE_NAME;
     doc["ip"]   = WiFi.localIP().toString();
     char buf[128]; serializeJson(doc, buf);
-    mqtt.publish("audioauto/register", buf, true);   // retained
+    mqtt.publish("audioauto/register", buf, true);
 }
 
 void connectMQTT() {
@@ -242,8 +280,6 @@ void publishTelemetry() {
     doc["ssid"]        = WiFi.SSID();
     doc["audio_state"] = (state == PLAYING) ? "playing" :
                          (state == WAITING_SYNC) ? "buffering" : "idle";
-    float t = (float)temperatureRead();
-    doc["temperature"] = (t > 0 && t < 125) ? t : 0.0f;
     char buf[256]; serializeJson(doc, buf);
     mqtt.publish(("audioauto/telemetry/" + String(DEVICE_NAME)).c_str(), buf);
 }
@@ -274,16 +310,20 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
         stopAudio();
         logMsg("CMD " + action);
     }
-    // ── seek ─────────────────────────────────────────────────────────────────
+    // ── seek — restart stream from new position ───────────────────────────────
     else if (action == "seek") {
-        double st  = doc["start_time"] | 0.0;
-        float  pos = doc["position"]   | 0.0f;
+        double st = doc["start_time"] | 0.0;
+        float pos = doc["position"]   | 0.0f;
         if (st > 0) {
             syncStartTime   = st;
             pendingPosition = pos;
+            pendingUrl      = (state == PLAYING && mp3 && mp3->isRunning())
+                              ? ""  // reuse current URL
+                              : pendingUrl;
             stopAudio();
             state = WAITING_SYNC;
         } else {
+            // Immediate seek — restart stream at new position
             if (pendingUrl.length() > 0) startStream(pendingUrl, pos, currentVolume);
         }
         logMsg("CMD seek → " + String(pos, 2));
@@ -296,7 +336,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
     }
     // ── speed — not supported ─────────────────────────────────────────────────
     else if (action == "speed") {
-        logMsg("CMD speed: not supported on ESP8266Audio");
+        logMsg("CMD speed: not supported on ESP8266Audio / C3/C6");
     }
     // ── sync_time ─────────────────────────────────────────────────────────────
     else if (action == "sync_time") {
@@ -309,10 +349,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
 void setup() {
     Serial.begin(115200);
     delay(800);
-    Serial.println("\n╔══════════════════════════════════╗");
-    Serial.println("║  Audio-Auto  ESP32  v3.0         ║");
-    Serial.println("║  Library: ESP8266Audio            ║");
-    Serial.println("╚══════════════════════════════════╝");
+    Serial.printf("\n╔══════════════════════════════════╗\n"
+                  "║  Audio-Auto  %-10s v3.0   ║\n"
+                  "╚══════════════════════════════════╝\n", CHIP_NAME);
     Serial.println(DEVICE_NAME);
 
     // WiFi
@@ -323,7 +362,6 @@ void setup() {
     while (wifiMulti.run() != WL_CONNECTED) { delay(500); Serial.print('.'); }
     Serial.printf(" OK → %s  IP %s  RSSI %d dBm\n",
         WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
-    Serial.printf("FreeHeap: %d bytes\n", ESP.getFreeHeap());
 
     // NTP
     syncNTP();
@@ -340,9 +378,10 @@ void setup() {
 
 // ═══════════════════════════════════════════════════════════════════════════
 void loop() {
-    // Feed the MP3 decoder — must run every loop iteration without blocking
+    // ── Feed the MP3 decoder — must run every loop iteration ─────────────────
     if (mp3 && mp3->isRunning()) {
         if (!mp3->loop()) {
+            // Stream ended naturally
             logMsg("Playback finished");
             stopAudio();
         }
@@ -357,7 +396,8 @@ void loop() {
         }
     }
 
-    // MQTT watchdog
+    // MQTT watchdog — use reduced poll interval during playback so mp3->loop()
+    // gets enough CPU time on the single core.
     if (!mqtt.connected()) connectMQTT();
     mqtt.loop();
 
@@ -376,6 +416,7 @@ void loop() {
         } else {
             double now = getUnixTime();
             if (now < 1577836800.0) {
+                // NTP not synced — use millis estimate (300 ms margin)
                 ntpFallbackMs = millis() + 300;
                 logMsg("WARN: NTP not synced — using millis fallback");
             } else if (now >= syncStartTime) {
@@ -385,8 +426,9 @@ void loop() {
 
         if (fire) {
             syncStartTime = 0;
-            if (pendingUrl.length() > 0)
+            if (pendingUrl.length() > 0) {
                 startStream(pendingUrl, pendingPosition, currentVolume);
+            }
             pendingPosition = 0.0f;
         }
     }
