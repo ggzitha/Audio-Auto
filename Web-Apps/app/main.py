@@ -109,6 +109,23 @@ def audio_url(server_host: str, filename: str) -> str:
     return f"http://{server_host}/audio_files/{encoded}"
 
 
+def _calc_bitrate_kbps(filename: str, duration_sec: float) -> int:
+    """
+    Estimate the average bitrate of an audio file in kbps.
+    Used by MQTT play commands so ESP32 clients can compute accurate
+    byte-offset seeks (byteOffset = seekSec × bitrate_kbps × 1000 / 8).
+    Falls back to 128 kbps if the file is missing or duration is 0.
+    """
+    if duration_sec and duration_sec > 0:
+        file_path = os.path.join("audio_files", filename)
+        try:
+            file_size = os.path.getsize(file_path)
+            return max(32, int((file_size * 8) / (duration_sec * 1000)))
+        except OSError:
+            pass
+    return 128  # safe default
+
+
 max_retries = 30
 for i in range(max_retries):
     try:
@@ -254,13 +271,15 @@ def execute_schedule(schedule_id: int):
             url = audio_url("192.168.88.8:9876", audio.filename)
             # Give 5s for all devices to receive and buffer
             start_time = int(time.time()) + 5
+            bitrate_kbps = _calc_bitrate_kbps(audio.filename, audio.duration_sec)
 
             cmd = {
                 "action": "play",
                 "url": url,
                 "start_time": start_time,
                 "volume": schedule.volume,
-                "position": 0.0
+                "position": 0.0,
+                "bitrate_kbps": bitrate_kbps
             }
             mqtt_handler.publish_command(schedule.device_name, cmd)
 
@@ -535,10 +554,19 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
             tc_filename = f"{orig_name.rsplit('.', 1)[0]}_tc.{target_ext}"
             tc_path = os.path.join("audio_files", tc_filename)
             
-            cmd = ["ffmpeg", "-y", "-i", orig_path, "-ar", c_samplerate]
+            cmd = ["ffmpeg", "-y", "-i", orig_path,
+                   "-ar", c_samplerate,
+                   "-ac", "2",            # stereo — helix decoder expects stereo
+                   "-map_metadata", "-1", # strip ID3/metadata tags — large tags
+                                           # can corrupt helix frame-sync on ESP32
+                   ]
             if c_type == "lossy":
                 bitrate = c_bitrate if "k" in c_bitrate else c_bitrate + "k"
-                cmd.extend(["-b:a", bitrate])
+                if target_ext == "mp3":
+                    # Force true CBR — VBR/ABR causes helix decoder frame-sync loss
+                    cmd.extend(["-b:a", bitrate, "-abr", "0"])
+                else:
+                    cmd.extend(["-b:a", bitrate])
             elif c_type == "lossless":
                 if target_ext == "wav":
                     cmd.extend(["-c:a", "pcm_s" + c_bitrate.replace("bit", "") + "le"])
@@ -559,12 +587,25 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
                 if os.path.exists(orig_path):
                     os.remove(orig_path)
                 
-                # Update DB
+                # Re-probe duration for the transcoded file and update DB
                 db_sess = database.SessionLocal()
                 try:
                     db_audio = db_sess.query(models.AudioFile).filter(models.AudioFile.id == audio_id).first()
                     if db_audio:
                         db_audio.filename = tc_filename
+                        # Update duration for accurate bitrate_kbps calculation
+                        try:
+                            import subprocess as _sp
+                            res = _sp.run(
+                                ["ffprobe", "-v", "error",
+                                 "-show_entries", "format=duration",
+                                 "-of", "default=noprint_wrappers=1:nokey=1",
+                                 tc_path],
+                                capture_output=True, text=True
+                            )
+                            db_audio.duration_sec = float(res.stdout.strip())
+                        except Exception:
+                            pass  # keep original duration if probe fails
                         db_sess.commit()
                 finally:
                     db_sess.close()
@@ -697,13 +738,15 @@ def realtime_play(
     url = audio_url("192.168.88.8:9876", audio.filename)
     # Give 2 seconds for all listeners to receive the command and buffer
     start_time = int(time.time()) + 2
+    bitrate_kbps = _calc_bitrate_kbps(audio.filename, audio.duration_sec)
 
     cmd = {
         "action": "play",
         "url": url,
         "start_time": start_time,
         "volume": volume,
-        "position": position
+        "position": position,
+        "bitrate_kbps": bitrate_kbps
     }
 
     global global_state

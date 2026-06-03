@@ -1,21 +1,42 @@
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
- * ║     Audio-Auto Client  —  ESP32-C3 / ESP32-C6                           ║
+ * ║     Audio-Auto Client  —  ESP32-C3 / ESP32-C6   v4.0                    ║
  * ║     Library: ESP8266Audio by earlephilhower                              ║
  * ╚══════════════════════════════════════════════════════════════════════════╝
  *
- * WHY A DIFFERENT FIRMWARE?
- *   ESP32-audioI2S v3.x uses xTaskCreatePinnedToCore() which requires 2 CPU
- *   cores. ESP32-C3 and ESP32-C6 are single-core RISC-V — that library simply
- *   won't compile for them. ESP8266Audio was originally written for the ESP8266
- *   (also single-core) and works on C3/C6 without PSRAM.
+ * v4.0  — Non-blocking state machine
+ * ────────────────────────────────────────────────────────────────────────────
+ *  Problem (v3.x)              │  Fix (v4.0)
+ * ─────────────────────────────┼──────────────────────────────────────────────
+ *  Commands dropped during     │  mqttCallback() only writes pendingCmd;
+ *  stream start                │  loop() processes it every iteration
+ * ─────────────────────────────┼──────────────────────────────────────────────
+ *  1 s blocking delay()        │  PREFILLING state — timer checked each
+ *  freezes WiFi/MQTT           │  loop() call; no delay() in audio path
+ * ─────────────────────────────┼──────────────────────────────────────────────
+ *  Seek byte-offset hardcoded  │  bitrate_kbps from MQTT payload;
+ *  at 128 kbps                 │  byteOff = seekSec × (kbps×1000/8)
+ * ─────────────────────────────┼──────────────────────────────────────────────
+ *  I2S re-created on every     │  i2sOut kept alive; only created once
+ *  song (audible pop/silence)  │  (or when it was never made)
+ * ─────────────────────────────┼──────────────────────────────────────────────
+ *  Sync → play gap visible     │  HTTP opens + buffer fills during
+ *  as silence                  │  PREFILLING state (warm by fire time)
+ * ─────────────────────────────┼──────────────────────────────────────────────
+ *  50-second drift on next     │  adjPos = pendingPos + (now - syncFireTime)
+ *  song / late MQTT delivery   │  applied at fire time before openStream()
+ * ────────────────────────────────────────────────────────────────────────────
+ *
+ * State machine:
+ *   IDLE ──play cmd──► WAITING_SYNC ──fire──► PREFILLING ──timer──► PLAYING
+ *        ◄──stop────────────────────────────────────────────────────────────
  *
  * ┌─────────────────────────────────────────────────────────────────────────┐
  * │  WIRING — PCM5102A  →  ESP32-C3                                         │
  * ├──────────────┬────────────┬─────────────────────────────────────────────┤
  * │  PCM5102A    │  ESP32-C3  │  Notes                                       │
  * ├──────────────┼────────────┼─────────────────────────────────────────────┤
- * │  VCC         │  3.3V      │  Module also works on 5V                     │
+ * │  VCC         │  3.3V      │                                              │
  * │  GND         │  GND       │                                              │
  * │  BCK         │  GPIO 5    │  Bit Clock (BCLK)                           │
  * │  LCK / LRCK  │  GPIO 4    │  Word Select (Left-Right Clock)             │
@@ -41,13 +62,6 @@
  * └──────────────┴────────────┴─────────────────────────────────────────────┘
  *
  * ┌─────────────────────────────────────────────────────────────────────────┐
- * │  AUDIO OUTPUT (both C3 and C6)                                           │
- * │  PCM5102A OUTL → AUX Left  (3.5mm Tip)                                 │
- * │  PCM5102A OUTR → AUX Right (3.5mm Ring)                                 │
- * │  PCM5102A GND  → AUX GND   (3.5mm Sleeve)                              │
- * └─────────────────────────────────────────────────────────────────────────┘
- *
- * ┌─────────────────────────────────────────────────────────────────────────┐
  * │  REQUIRED LIBRARIES (Arduino Library Manager)                            │
  * │  • ESP8266Audio  by earlephilhower  (search "ESP8266Audio")              │
  * │  • PubSubClient  by Nick O'Leary                                         │
@@ -57,10 +71,9 @@
  * ┌─────────────────────────────────────────────────────────────────────────┐
  * │  BOARD SETTINGS (Arduino IDE → Tools)                                    │
  * │  ESP32-C3: Board = "ESP32C3 Dev Module"                                  │
- * │            USB CDC On Boot = "Enabled" (for Serial Monitor)              │
  * │  ESP32-C6: Board = "ESP32C6 Dev Module"                                  │
- * │            USB CDC On Boot = "Enabled"                                   │
  * │  CPU Freq : 160 MHz (recommended for audio decode)                       │
+ * │  USB CDC On Boot = "Enabled" (for Serial Monitor)                        │
  * └─────────────────────────────────────────────────────────────────────────┘
  */
 
@@ -76,20 +89,18 @@
   #define I2S_LRC   18
   #define I2S_DOUT  20
 #else
-  // Fallback for compiling on any other ESP32 variant
   #define CHIP_NAME "ESP32-Generic"
   #define I2S_BCLK  26
   #define I2S_LRC   25
   #define I2S_DOUT  22
-  #warning "Audio_Client_C3C6 is intended for ESP32-C3/C6. For ESP32 classic use Audio_Client instead."
+  #warning "Audio_Client_C3C6 is intended for ESP32-C3/C6."
 #endif
 
-// ESP8266Audio headers
+// ESP8266Audio
 #include <AudioGeneratorMP3.h>
 #include <AudioFileSourceHTTPStream.h>
 #include <AudioFileSourceBuffer.h>
 #include <AudioOutputI2S.h>
-
 
 #include <WiFi.h>
 #include <WiFiMulti.h>
@@ -101,10 +112,7 @@
 //  ▶  USER CONFIGURATION — edit these for every device
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Unique name per device.
-// Format: ESP32c3-RoomCode-Number  or  ESP32c6-RoomCode-Number
-// Examples: ESP32c3-Hall-001, ESP32c6-Lobby-002
-const char* DEVICE_NAME = "ESP32c3-Ruang-B001";
+const char* DEVICE_NAME = "ESP32c6-Ruang-C001";
 
 // WiFi — up to 3 networks, picks strongest automatically
 const char* WIFI_SSID1 = "DCLXVI";          const char* WIFI_PASS1 = "1029384756";
@@ -124,106 +132,177 @@ const char* NTP3 = "time.cloudflare.com";
 const long  TZ_OFFSET_SEC = 9 * 3600;
 const int   DST_OFFSET    = 0;
 
+// How long (ms) to let the HTTP buffer fill before starting the decoder.
+// Increase if you still hear glitches at the start; 600 ms works on LAN.
+static const uint32_t PREFILL_MS = 600;
+
 // ═══════════════════════════════════════════════════════════════════════════
 
 WiFiMulti    wifiMulti;
 WiFiClient   netClient;
 PubSubClient mqtt(netClient);
 
-// ESP8266Audio objects (heap-allocated so we can delete/recreate on each play)
-AudioOutputI2S*           i2sOut  = nullptr;
-AudioFileSourceHTTPStream* http   = nullptr;   // raw HTTP stream
-AudioFileSourceBuffer*    source  = nullptr;   // 4 kB RAM buffer
-AudioGeneratorMP3*        mp3     = nullptr;
+// ── Audio state machine ────────────────────────────────────────────────────
+//
+//  IDLE ──play──► WAITING_SYNC ──fire──► PREFILLING ──timer──► PLAYING
+//       ◄──stop────────────────────────────────────────────────
+//
+enum AudioState { IDLE, WAITING_SYNC, PREFILLING, PLAYING };
+AudioState audioState = IDLE;
 
+// ── Command queue ─────────────────────────────────────────────────────────
+// mqttCallback() only writes here; loop() reads and acts.
+// This prevents commands from being dropped or from causing re-entrancy
+// issues while the audio stack is mid-operation.
+struct PendingCmd {
+    String  action;       // "play" | "stop" | "seek" | "volume" | "sync_time"
+    String  url;
+    double  startTime;    // Unix timestamp to begin playback
+    float   position;     // seconds from track start at startTime
+    int     volume;       // 0–100
+    int     bitrateKbps;  // used for accurate byte-offset seek
+    bool    pending;      // true = unprocessed command waiting in loop()
+};
+PendingCmd pendingCmd = {"", "", 0, 0.0f, 80, 128, false};
 
-// Playback state
-enum AudioState { IDLE, WAITING_SYNC, PLAYING };
-AudioState   state           = IDLE;
-String       pendingUrl      = "";
-double       syncStartTime   = 0;
-float        pendingPosition = 0.0f;
-int          currentVolume   = 80;   // 0–100 %
+// ── Playback parameters ───────────────────────────────────────────────────
+String   currentUrl         = "";
+int      currentVolume      = 80;
+int      currentBitrateKbps = 128;
 
-unsigned long lastTelemetry  = 0;
-unsigned long lastWifiCheck  = 0;
-unsigned long ntpFallbackMs  = 0;
+// Preserved at command-receive time; used to compute drift at fire time
+double   syncFireTime    = 0;
+float    pendingPosition = 0.0f;
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// PREFILLING timer — duration adapts to buffer size / bitrate
+uint32_t prefillStart = 0;
+uint32_t prefillMs    = 600;   // set by openStream() per track
+
+// Misc timers
+unsigned long lastTelemetry = 0;
+unsigned long lastWifiCheck = 0;
+unsigned long ntpFallbackMs = 0;
+
+// ── ESP8266Audio objects ──────────────────────────────────────────────────
+// i2sOut is kept alive across tracks (created once, reused).
+// http / buf / mp3 are heap-allocated per track and deleted on stop.
+AudioOutputI2S*            i2sOut = nullptr;
+AudioFileSourceHTTPStream* http   = nullptr;
+AudioFileSourceBuffer*     buf    = nullptr;
+AudioGeneratorMP3*         mp3    = nullptr;
+
+// ── Helpers ──────────────────────────────────────────────────────────────
 
 void logMsg(const String& msg) {
     Serial.println(msg);
-    if (mqtt.connected()) {
+    if (mqtt.connected())
         mqtt.publish(("audioauto/log/" + String(DEVICE_NAME)).c_str(), msg.c_str());
-    }
 }
 
-// ── Audio control ────────────────────────────────────────────────────────────
-
-void stopAudio() {
-    if (mp3 && mp3->isRunning()) mp3->stop();
-    delete mp3;    mp3    = nullptr;
-    if (source) { source->close(); delete source; source = nullptr; }
-    if (http)   { http->close();   delete http;   http   = nullptr; }
-    state = IDLE;
+double getUnixTime() {
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    return (double)tv.tv_sec + (double)tv.tv_usec / 1e6;
 }
 
+// ── Audio control ─────────────────────────────────────────────────────────
 
 /**
- * Start streaming MP3 from an HTTP URL.
- * seekSec — approximate position in seconds.
- *   ESP8266Audio's AudioFileSourceHTTPStream::seek() internally re-issues the
- *   HTTP request with a Range header on ESP32 builds, so this works correctly.
- * volPct  — 0–100 volume
+ * Stop and free the decoder + stream, but keep i2sOut alive to avoid
+ * I2S re-init overhead and the audible pop it produces.
  */
-void startStream(const String& url, float seekSec, int volPct) {
-    stopAudio();
+void closeStream() {
+    if (mp3 && mp3->isRunning()) mp3->stop();
+    delete mp3; mp3 = nullptr;
+    delete buf; buf = nullptr;
+    delete http; http = nullptr;
+    // i2sOut intentionally NOT deleted — reuse across tracks
+    audioState = IDLE;
+}
 
-    Serial.printf("[Stream] %s  pos=%.1fs  vol=%d%%\n",
-                  url.c_str(), seekSec, volPct);
+/**
+ * Open the HTTP stream and allocate the buffer.
+ * Called at sync-fire time so the buffer can pre-fill during PREFILLING
+ * state — by the time beginDecoder() is called, there is already data.
+ *
+ * seekSec      : position in seconds (already drift-corrected)
+ * bitrateKbps  : actual file bitrate for accurate byte-offset calculation
+ */
+bool openStream(const String& url, float seekSec, int bitrateKbps) {
+    closeStream();
 
-    // Create I2S output once; reuse across tracks
+    // Create I2S output once; reuse on subsequent tracks
     if (!i2sOut) {
         i2sOut = new AudioOutputI2S(0, AudioOutputI2S::EXTERNAL_I2S);
         i2sOut->SetPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+        Serial.printf("[I2S] created — BCLK=%d LRC=%d DOUT=%d\n",
+                      I2S_BCLK, I2S_LRC, I2S_DOUT);
     }
-    i2sOut->SetGain(volPct / 100.0f);   // 0.0–1.0
+    i2sOut->SetGain(currentVolume / 100.0f);
 
-    // Open HTTP stream
+    // Open HTTP
     http = new AudioFileSourceHTTPStream(url.c_str());
+    Serial.printf("[HTTP] isOpen=%d\n", http->isOpen() ? 1 : 0);
     if (!http->isOpen()) {
         logMsg("ERROR: HTTP open failed: " + url);
         delete http; http = nullptr;
-        state = IDLE;
-        return;
+        return false;
     }
 
-    // Approximate seek via byte offset (128 kbps = 16 000 B/s)
-    // seek() on ESP32 AudioFileSourceHTTPStream re-opens with Range: bytes=N-
-    if (seekSec > 1.0f) {
-        uint32_t byteOffset = (uint32_t)(seekSec * 16000.0f);
+    // Accurate seek: bytes = seconds × (bitrate_kbps × 1000 / 8)
+    if (seekSec > 0.5f) {
+        uint32_t bytesPerSec = (uint32_t)((float)bitrateKbps * 1000.0f / 8.0f);
+        uint32_t byteOffset  = (uint32_t)(seekSec * (float)bytesPerSec);
+        Serial.printf("[Seek] %.2fs → byte %u  (%d kbps, %u B/s)\n",
+                      seekSec, byteOffset, bitrateKbps, bytesPerSec);
         if (!http->seek(byteOffset, SEEK_SET)) {
-            // seek not supported on this build — play from start, accept drift
-            Serial.printf("[Stream] seek unsupported, playing from 0 (drift %.1fs)\n", seekSec);
+            Serial.println("[Seek] Range not supported, playing from 0");
         }
     }
 
-    // 4 kB RAM buffer to smooth out WiFi jitter
-    source = new AudioFileSourceBuffer(http, 4096);
+    // Adaptive buffer: scale with bitrate so high-bitrate files (>160 kbps)
+    // don't drain the buffer between TCP reads on single-core C6.
+    //   ≤ 160 kbps → 16 kB  (comfortable for CBR 128/160 MP3)
+    //   ≤ 256 kbps → 24 kB  (covers 192/256 kbps)
+    //   ≤ 320 kbps → 32 kB  (covers 256/320 kbps CBR)
+    //   > 320 kbps → 40 kB  (high-quality originals, lossless-like)
+    uint32_t bufSize;
+    if      (bitrateKbps <= 160) bufSize = 16384;
+    else if (bitrateKbps <= 256) bufSize = 24576;
+    else if (bitrateKbps <= 320) bufSize = 32768;
+    else                         bufSize = 40960;
 
-    mp3 = new AudioGeneratorMP3();
-    if (!mp3->begin(source, i2sOut)) {
-        logMsg("ERROR: MP3 decoder failed to start");
-        stopAudio();
-        return;
-    }
+    buf = new AudioFileSourceBuffer(http, bufSize);
 
-    state = PLAYING;
-    logMsg("Playing: " + url);
+    // Adaptive prefill time: enough to fill ~75% of the buffer at the given
+    // bitrate. t_fill = (bufSize * 0.75 * 8) / (bitrateKbps * 1000)  seconds.
+    // Clamped 600–1500 ms so it's never too short or too long.
+    uint32_t fillMs = (uint32_t)((bufSize * 0.75f * 8.0f)
+                                 / ((float)bitrateKbps * 1000.0f) * 1000.0f);
+    prefillMs = constrain(fillMs, 600, 1500);
+
+    Serial.printf("[Buffer] %u kB allocated for %d kbps — prefill %u ms\n",
+                  bufSize / 1024, bitrateKbps, prefillMs);
+    return true;
 }
 
+/**
+ * Attach the MP3 decoder to the warm buffer and start playback.
+ * Called after PREFILL_MS has elapsed so the buffer already has data.
+ */
+void beginDecoder() {
+    mp3 = new AudioGeneratorMP3();
+    if (!mp3->begin(buf, i2sOut)) {
+        logMsg("ERROR: MP3 decoder failed to start");
+        closeStream();
+        return;
+    }
+    Serial.println("[MP3] begin() OK — isRunning=" + String(mp3->isRunning()));
+    audioState = PLAYING;
+    logMsg("Playing: " + currentUrl);
+}
 
-// ── NTP ─────────────────────────────────────────────────────────────────────
+// ── NTP ──────────────────────────────────────────────────────────────────
 
 bool syncNTP() {
     configTime(TZ_OFFSET_SEC, DST_OFFSET, NTP1, NTP2, NTP3);
@@ -240,13 +319,7 @@ bool syncNTP() {
     return false;
 }
 
-double getUnixTime() {
-    struct timeval tv;
-    gettimeofday(&tv, nullptr);
-    return (double)tv.tv_sec + (double)tv.tv_usec / 1e6;
-}
-
-// ── MQTT ─────────────────────────────────────────────────────────────────────
+// ── MQTT ─────────────────────────────────────────────────────────────────
 
 void registerDevice() {
     StaticJsonDocument<128> doc;
@@ -278,12 +351,20 @@ void publishTelemetry() {
     doc["ip"]          = WiFi.localIP().toString();
     doc["rssi"]        = WiFi.RSSI();
     doc["ssid"]        = WiFi.SSID();
-    doc["audio_state"] = (state == PLAYING) ? "playing" :
-                         (state == WAITING_SYNC) ? "buffering" : "idle";
+    doc["audio_state"] = (audioState == PLAYING)    ? "playing"   :
+                         (audioState == PREFILLING)  ? "buffering" :
+                         (audioState == WAITING_SYNC)? "waiting"   : "idle";
     char buf[256]; serializeJson(doc, buf);
     mqtt.publish(("audioauto/telemetry/" + String(DEVICE_NAME)).c_str(), buf);
 }
 
+/**
+ * MQTT callback — ONLY writes to pendingCmd.
+ * Never calls closeStream(), openStream(), or beginDecoder() here.
+ * Calling audio functions from a callback is unsafe because the callback
+ * can fire mid-loop() while the audio stack is in an intermediate state,
+ * causing crashes or dropped frames.
+ */
 void mqttCallback(char* topic, byte* payload, unsigned int len) {
     String msg; msg.reserve(len);
     for (unsigned int i = 0; i < len; i++) msg += (char)payload[i];
@@ -292,57 +373,17 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
     StaticJsonDocument<512> doc;
     if (deserializeJson(doc, msg)) { Serial.println("JSON err"); return; }
 
-    String action = doc["action"] | "";
+    pendingCmd.action      = doc["action"] | "";
+    pendingCmd.url         = doc["url"]    | "";      // empty = reuse currentUrl
+    pendingCmd.startTime   = doc["start_time"].as<double>();
+    pendingCmd.position    = doc["position"]   | 0.0f;
+    pendingCmd.volume      = constrain((int)(doc["volume"] | currentVolume), 0, 100);
+    pendingCmd.bitrateKbps = doc["bitrate_kbps"] | 128;
+    pendingCmd.pending     = true;
 
-    // ── play ─────────────────────────────────────────────────────────────────
-    if (action == "play") {
-        pendingUrl      = doc["url"] | "";
-        syncStartTime   = doc["start_time"].as<double>();
-        pendingPosition = doc["position"] | 0.0f;
-        currentVolume   = constrain((int)(doc["volume"] | 80), 0, 100);
-        stopAudio();
-        state = WAITING_SYNC;
-        logMsg("CMD play → t=" + String(syncStartTime, 3)
-               + "  pos=" + String(pendingPosition, 2));
-    }
-    // ── stop / pause ─────────────────────────────────────────────────────────
-    else if (action == "stop" || action == "pause") {
-        stopAudio();
-        logMsg("CMD " + action);
-    }
-    // ── seek — restart stream from new position ───────────────────────────────
-    else if (action == "seek") {
-        double st = doc["start_time"] | 0.0;
-        float pos = doc["position"]   | 0.0f;
-        if (st > 0) {
-            syncStartTime   = st;
-            pendingPosition = pos;
-            pendingUrl      = (state == PLAYING && mp3 && mp3->isRunning())
-                              ? ""  // reuse current URL
-                              : pendingUrl;
-            stopAudio();
-            state = WAITING_SYNC;
-        } else {
-            // Immediate seek — restart stream at new position
-            if (pendingUrl.length() > 0) startStream(pendingUrl, pos, currentVolume);
-        }
-        logMsg("CMD seek → " + String(pos, 2));
-    }
-    // ── volume ────────────────────────────────────────────────────────────────
-    else if (action == "volume") {
-        currentVolume = constrain((int)(doc["volume"] | 80), 0, 100);
-        if (i2sOut) i2sOut->SetGain(currentVolume / 100.0f);
-        logMsg("CMD volume → " + String(currentVolume) + "%");
-    }
-    // ── speed — not supported ─────────────────────────────────────────────────
-    else if (action == "speed") {
-        logMsg("CMD speed: not supported on ESP8266Audio / C3/C6");
-    }
-    // ── sync_time ─────────────────────────────────────────────────────────────
-    else if (action == "sync_time") {
-        syncNTP();
-        logMsg("NTP re-synced");
-    }
+    Serial.printf("[Queue] action=%s  t=%.3f  pos=%.2f  kbps=%d\n",
+                  pendingCmd.action.c_str(), pendingCmd.startTime,
+                  pendingCmd.position, pendingCmd.bitrateKbps);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -350,7 +391,7 @@ void setup() {
     Serial.begin(115200);
     delay(800);
     Serial.printf("\n╔══════════════════════════════════╗\n"
-                  "║  Audio-Auto  %-10s v3.0          ║\n"
+                  "║  Audio-Auto  %-10s v4.0   ║\n"
                   "╚══════════════════════════════════╝\n", CHIP_NAME);
     Serial.println(DEVICE_NAME);
 
@@ -379,16 +420,80 @@ void setup() {
 
 // ═══════════════════════════════════════════════════════════════════════════
 void loop() {
-    // ── Feed the MP3 decoder — must run every loop iteration ─────────────────
-    if (mp3 && mp3->isRunning()) {
-        if (!mp3->loop()) {
-            // Stream ended naturally
-            logMsg("Playback finished");
-            stopAudio();
+
+    // ── 1. Process pending MQTT command ──────────────────────────────────────
+    // Safe to call audio functions here since we're in the main loop context.
+    if (pendingCmd.pending) {
+        pendingCmd.pending = false;
+        String act = pendingCmd.action;
+
+        if (act == "stop" || act == "pause") {
+            closeStream();
+            logMsg("CMD " + act);
+
+        } else if (act == "volume") {
+            currentVolume = pendingCmd.volume;
+            if (i2sOut) i2sOut->SetGain(currentVolume / 100.0f);
+            logMsg("CMD volume → " + String(currentVolume) + "%");
+
+        } else if (act == "speed") {
+            logMsg("CMD speed: not supported on ESP8266Audio");
+
+        } else if (act == "sync_time") {
+            syncNTP();
+            logMsg("NTP re-synced");
+
+        } else if (act == "play") {
+            closeStream();
+            if (pendingCmd.url.length() > 0) currentUrl = pendingCmd.url;
+            currentVolume      = pendingCmd.volume;
+            currentBitrateKbps = pendingCmd.bitrateKbps;
+            syncFireTime       = pendingCmd.startTime;
+            pendingPosition    = pendingCmd.position;
+            audioState = WAITING_SYNC;
+            logMsg("CMD play → t=" + String(syncFireTime, 3)
+                   + "  pos=" + String(pendingPosition, 2)
+                   + "  kbps=" + String(currentBitrateKbps));
+
+        } else if (act == "seek") {
+            // Seek re-opens the stream at a new position.
+            // If startTime is in the future, enter WAITING_SYNC.
+            // If it has already passed, fire immediately with drift correction.
+            closeStream();
+            if (pendingCmd.url.length() > 0) currentUrl = pendingCmd.url;
+            currentVolume      = pendingCmd.volume;
+            currentBitrateKbps = pendingCmd.bitrateKbps;
+
+            double now = getUnixTime();
+            if (pendingCmd.startTime > now) {
+                // Future fire time — wait
+                syncFireTime    = pendingCmd.startTime;
+                pendingPosition = pendingCmd.position;
+                audioState = WAITING_SYNC;
+            } else {
+                // Fire immediately with drift correction
+                double overrun = max(0.0, now - pendingCmd.startTime);
+                float adjPos   = pendingCmd.position + (float)overrun;
+                Serial.printf("[Drift] seek overrun=%.3fs → adjPos=%.2fs\n", overrun, adjPos);
+                if (openStream(currentUrl, adjPos, currentBitrateKbps)) {
+                    prefillStart = millis();
+                    audioState = PREFILLING;
+                }
+            }
+            logMsg("CMD seek → " + String(pendingCmd.position, 2));
         }
     }
 
-    // WiFi watchdog (every 5 s)
+    // ── 2. Feed MP3 decoder ──────────────────────────────────────────────────
+    if (audioState == PLAYING && mp3 && mp3->isRunning()) {
+        if (!mp3->loop()) {
+            Serial.println("[MP3] stream ended");
+            logMsg("Playback finished");
+            closeStream();
+        }
+    }
+
+    // ── 3. WiFi watchdog (every 5 s) ─────────────────────────────────────────
     if (millis() - lastWifiCheck > 5000) {
         lastWifiCheck = millis();
         if (wifiMulti.run() != WL_CONNECTED) {
@@ -397,40 +502,57 @@ void loop() {
         }
     }
 
-    // MQTT watchdog — use reduced poll interval during playback so mp3->loop()
-    // gets enough CPU time on the single core.
+    // ── 4. MQTT keepalive ────────────────────────────────────────────────────
     if (!mqtt.connected()) connectMQTT();
     mqtt.loop();
 
-    // Telemetry every 15 s
+    // ── 5. Telemetry (every 15 s) ────────────────────────────────────────────
     if (millis() - lastTelemetry > 15000) {
         lastTelemetry = millis();
         publishTelemetry();
     }
 
-    // ── Synchronized playback state machine ──────────────────────────────────
-    if (state == WAITING_SYNC) {
+    // ── 6. Sync state machine ────────────────────────────────────────────────
+    if (audioState == WAITING_SYNC) {
         bool fire = false;
 
-        if (ntpFallbackMs > 0) {
-            if (millis() >= ntpFallbackMs) { fire = true; ntpFallbackMs = 0; }
-        } else {
-            double now = getUnixTime();
-            if (now < 1577836800.0) {
-                // NTP not synced — use millis estimate (300 ms margin)
+        double now = getUnixTime();
+        if (now < 1577836800.0) {
+            // NTP not yet synced — use a millis-based 300 ms fallback
+            if (ntpFallbackMs == 0) {
                 ntpFallbackMs = millis() + 300;
                 logMsg("WARN: NTP not synced — using millis fallback");
-            } else if (now >= syncStartTime) {
-                fire = true;
             }
+            if (millis() >= ntpFallbackMs) { fire = true; ntpFallbackMs = 0; }
+        } else {
+            fire = (now >= syncFireTime);
         }
 
         if (fire) {
-            syncStartTime = 0;
-            if (pendingUrl.length() > 0) {
-                startStream(pendingUrl, pendingPosition, currentVolume);
+            // Drift correction: account for MQTT delivery lag and any
+            // time elapsed since the intended fire timestamp.
+            double now2   = getUnixTime();
+            double overrun = max(0.0, now2 - syncFireTime);
+            float adjPos   = pendingPosition + (float)overrun;
+            Serial.printf("[Drift] overrun=%.3fs → adjPos=%.2fs (was %.2fs)\n",
+                          overrun, adjPos, pendingPosition);
+
+            if (openStream(currentUrl, adjPos, currentBitrateKbps)) {
+                prefillStart = millis();
+                audioState   = PREFILLING;
+            } else {
+                audioState = IDLE;
             }
-            pendingPosition = 0.0f;
+        }
+    }
+
+    // ── 7. PREFILLING — non-blocking buffer warm-up ──────────────────────────
+    // MQTT and WiFi handlers above keep running every loop iteration.
+    // Once prefillMs has elapsed (adaptive per bitrate), the HTTP ring buffer
+    // has enough data and we start the decoder glitch-free.
+    if (audioState == PREFILLING) {
+        if (millis() - prefillStart >= prefillMs) {
+            beginDecoder();
         }
     }
 }

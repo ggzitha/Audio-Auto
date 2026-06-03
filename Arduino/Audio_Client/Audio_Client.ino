@@ -130,8 +130,8 @@ void logMsg(const String& msg) {
 void stopAudio() {
     if (mp3 && mp3->isRunning()) mp3->stop();
     delete mp3;    mp3    = nullptr;
-    if (source) { source->close(); delete source; source = nullptr; }
-    if (http)   { http->close();   delete http;   http   = nullptr; }
+    delete source; source = nullptr;
+    delete http;   http   = nullptr;
     state = IDLE;
 }
 
@@ -171,7 +171,7 @@ void startStream(const String& url, float seekSec, int volPct) {
         }
     }
 
-    // 8 KB buffer — smooths WiFi jitter on dual-core ESP32
+    // 8 KB buffer — pre-fetches HTTP data so the decoder never sees TCP starvation
     source = new AudioFileSourceBuffer(http, 8192);
 
     mp3 = new AudioGeneratorMP3();

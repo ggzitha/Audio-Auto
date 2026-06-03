@@ -67,13 +67,19 @@
                         </select>
                     </div>
                     <div>
-                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Sample Rate (Max 48kHz for ESP32)</label>
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                            Sample Rate
+                            <span class="ml-1 text-yellow-600 dark:text-yellow-400 text-xs font-normal"
+                                  title="ESP32 helix decoder stops early at 48 kHz — use 44.1 kHz">
+                                ⚠ 44.1 kHz recommended for ESP32
+                            </span>
+                        </label>
                         <select id="cfgTcSampleRate" name="transcode_samplerate" class="w-full bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 focus:ring-primary outline-none text-sm">
                             <option value="16000">16 KHz</option>
                             <option value="22050">22.05 KHz</option>
                             <option value="32000">32 KHz</option>
-                            <option value="44100" selected>44.1 KHz</option>
-                            <option value="48000">48 KHz</option>
+                            <option value="44100" selected>44.1 KHz ✓ (ESP32 safe)</option>
+                            <option value="48000">48 KHz ⚠ (web/phone only)</option>
                         </select>
                     </div>
                 </div>
