@@ -1291,6 +1291,10 @@ document.addEventListener('DOMContentLoaded', () => {
     // Load all files first so they're available when state arrives
     fetch('/api/files').then(r => r.json()).then(files => {
         window.allFiles = files;
+        // If state arrived before files finished loading, re-apply it now!
+        if (window.globalState && window.globalState.audio_id) {
+            applyServerState(window.globalState);
+        }
     });
 
     connectWebSocket();
