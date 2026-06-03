@@ -240,24 +240,26 @@ bool openStream(const String& url, float seekSec, int bitrateKbps) {
     }
     i2sOut->SetGain(currentVolume / 100.0f);
 
-    // Open HTTP
-    http = new AudioFileSourceHTTPStream(url.c_str());
-    Serial.printf("[HTTP] isOpen=%d\n", http->isOpen() ? 1 : 0);
-    if (!http->isOpen()) {
-        logMsg("ERROR: HTTP open failed: " + url);
-        delete http; http = nullptr;
-        return false;
+    // Accurate Frame-Sync Seek: instead of guessing byte offsets which causes
+    // static noise, we pass the time offset to the server. The server instantly
+    // slices the MP3 using FFmpeg and returns a clean stream.
+    String finalUrl = url;
+    if (seekSec > 0.1f) {
+        if (finalUrl.indexOf("?") == -1) {
+            finalUrl += "?seek_sec=" + String(seekSec, 2);
+        } else {
+            finalUrl += "&seek_sec=" + String(seekSec, 2);
+        }
+        Serial.printf("[Seek] Requesting exact time offset: %.2fs\n", seekSec);
     }
 
-    // Accurate seek: bytes = seconds × (bitrate_kbps × 1000 / 8)
-    if (seekSec > 0.5f) {
-        uint32_t bytesPerSec = (uint32_t)((float)bitrateKbps * 1000.0f / 8.0f);
-        uint32_t byteOffset  = (uint32_t)(seekSec * (float)bytesPerSec);
-        Serial.printf("[Seek] %.2fs → byte %u  (%d kbps, %u B/s)\n",
-                      seekSec, byteOffset, bitrateKbps, bytesPerSec);
-        if (!http->seek(byteOffset, SEEK_SET)) {
-            Serial.println("[Seek] Range not supported, playing from 0");
-        }
+    // Open HTTP with the new offset URL
+    http = new AudioFileSourceHTTPStream(finalUrl.c_str());
+    Serial.printf("[HTTP] isOpen=%d\n", http->isOpen() ? 1 : 0);
+    if (!http->isOpen()) {
+        logMsg("ERROR: HTTP open failed: " + finalUrl);
+        delete http; http = nullptr;
+        return false;
     }
 
     // Adaptive buffer: scale with bitrate so high-bitrate files (>160 kbps)

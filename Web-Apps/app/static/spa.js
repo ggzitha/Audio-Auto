@@ -23,6 +23,16 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     window.allFiles = [];
+    window.playTimeoutId = null;
+
+    if (localAudio && !window.localAudioEndedListenerAttached) {
+        localAudio.addEventListener('ended', () => {
+            if (!wavesurferInitialized && window.globalState.is_playing) {
+                stopPlayback();
+            }
+        });
+        window.localAudioEndedListenerAttached = true;
+    }
 
     // ─── WaveSurfer (singleton, lives forever) ────────────────────────────────
     let wavesurfer = null;
@@ -221,9 +231,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // Compute actual current playback position
         let actualPosition = state.position || 0;
+        let delayMs = 0;
         if (state.is_playing && state.last_updated > 0 && state.server_time > 0) {
-            const elapsed = state.server_time - state.last_updated;
-            actualPosition = (state.position || 0) + elapsed * (state.speed || 1.0);
+            const timeUntilStart = state.last_updated - state.server_time;
+            if (timeUntilStart > 0) {
+                delayMs = timeUntilStart * 1000;
+                actualPosition = state.position || 0;
+            } else {
+                const elapsed = -timeUntilStart;
+                actualPosition = (state.position || 0) + elapsed * (state.speed || 1.0);
+            }
             actualPosition = Math.max(0, actualPosition);
         }
         window.globalState.current_position = actualPosition;
@@ -254,47 +271,70 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // Play/Pause with autoplay unlock handling
         if (state.is_playing && state.audio_id) {
-            if (localAudio && localAudio.paused && localAudio.src && !localAudio.src.endsWith(window.location.host + '/')) {
+            if (localAudio && localAudio.src && !localAudio.src.endsWith(window.location.host + '/')) {
 
                 const tryPlay = () => {
-                    // Seek to synced position
-                    if (wavesurfer && wavesurfer.getDuration && wavesurfer.getDuration() > 0) {
-                        const duration = wavesurfer.getDuration();
-                        if (Math.abs(wavesurfer.getCurrentTime() - actualPosition) > 2.0) {
-                            wavesurfer.seekTo(Math.min(1, Math.max(0, actualPosition / duration)));
+                    const doPlay = () => {
+                        if (wavesurfer && wavesurfer.getDuration && wavesurfer.getDuration() > 0) {
+                            const duration = wavesurfer.getDuration();
+                            if (Math.abs(wavesurfer.getCurrentTime() - actualPosition) > 2.0) {
+                                wavesurfer.seekTo(Math.min(1, Math.max(0, actualPosition / duration)));
+                            }
+                            wavesurfer.play().catch(err => {
+                                if (err.name === 'NotAllowedError') { autoplayBlocked = true; showAutoplaySyncToast(); }
+                            });
+                        } else {
+                            if (Math.abs(localAudio.currentTime - actualPosition) > 2.0) {
+                                localAudio.currentTime = actualPosition;
+                            }
+                            localAudio.play().catch(err => {
+                                if (err.name === 'NotAllowedError') { autoplayBlocked = true; showAutoplaySyncToast(); }
+                            });
                         }
-                        wavesurfer.play().catch(err => {
-                            if (err.name === 'NotAllowedError') { autoplayBlocked = true; showAutoplaySyncToast(); }
-                        });
+                    };
+
+                    if (delayMs > 0) {
+                        if (localAudio && !localAudio.paused) localAudio.pause();
+                        if (wavesurfer) wavesurfer.pause();
+                        
+                        if (wavesurfer && wavesurfer.getDuration && wavesurfer.getDuration() > 0) {
+                            wavesurfer.seekTo(Math.min(1, Math.max(0, actualPosition / wavesurfer.getDuration())));
+                        } else if (localAudio) {
+                            localAudio.currentTime = actualPosition;
+                        }
+
+                        if (window.playTimeoutId) { clearTimeout(window.playTimeoutId); }
+                        window.playTimeoutId = setTimeout(() => {
+                            window.playTimeoutId = null;
+                            if (window.globalState.is_playing) doPlay();
+                        }, delayMs);
                     } else {
-                        localAudio.currentTime = actualPosition;
-                        localAudio.play().catch(err => {
-                            if (err.name === 'NotAllowedError') { autoplayBlocked = true; showAutoplaySyncToast(); }
-                        });
+                        if (window.playTimeoutId) { clearTimeout(window.playTimeoutId); window.playTimeoutId = null; }
+                        
+                        if (localAudio && !localAudio.paused) {
+                            const currentPos = wavesurfer && wavesurfer.getDuration && wavesurfer.getDuration() > 0 ? wavesurfer.getCurrentTime() : localAudio.currentTime;
+                            if (Math.abs(currentPos - actualPosition) > 3.0) {
+                                if (wavesurfer && wavesurfer.getDuration && wavesurfer.getDuration() > 0) {
+                                    wavesurfer.seekTo(Math.min(1, Math.max(0, actualPosition / wavesurfer.getDuration())));
+                                } else if (localAudio) {
+                                    localAudio.currentTime = actualPosition;
+                                }
+                            }
+                        } else {
+                            doPlay();
+                        }
                     }
                 };
 
-                // readyState < 2 (HAVE_CURRENT_DATA) means audio has not loaded yet.
-                // In that case, wait for 'canplay' before calling play() to avoid
-                // silent failures when audio was just assigned a new src.
                 if (localAudio.readyState < 2) {
                     localAudio.addEventListener('canplay', tryPlay, { once: true });
                 } else {
                     tryPlay();
                 }
 
-            } else if (localAudio && !localAudio.paused) {
-                // Already playing — just sync position if drifted more than 3s
-                const currentPos = wavesurfer ? wavesurfer.getCurrentTime() : localAudio.currentTime;
-                if (Math.abs(currentPos - actualPosition) > 3.0) {
-                    if (wavesurfer && wavesurfer.getDuration && wavesurfer.getDuration() > 0) {
-                        wavesurfer.seekTo(Math.min(1, Math.max(0, actualPosition / wavesurfer.getDuration())));
-                    } else if (localAudio) {
-                        localAudio.currentTime = actualPosition;
-                    }
-                }
             }
         } else if (!state.is_playing) {
+            if (window.playTimeoutId) { clearTimeout(window.playTimeoutId); window.playTimeoutId = null; }
             if (localAudio && !localAudio.paused) localAudio.pause();
             if (wavesurfer) wavesurfer.pause();
             // Remove autoplay toast when stopped
@@ -539,7 +579,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (miniProgressOverlay) miniProgressOverlay.style.width = pct + '%';
         });
 
-        wavesurfer.on('finish', playNext);
+        wavesurfer.on('finish', stopPlayback);
 
         _attachDashboardWaveSurferEvents();
     }
@@ -551,7 +591,10 @@ document.addEventListener('DOMContentLoaded', () => {
         wavesurfer.on('interaction', (newPosition) => {
             if (!window.globalState.audio_id) return;
             if (window.globalState.is_playing) {
-                pushStateChange('seek', { position: newPosition });
+                pushStateChange('seek', { 
+                    position: newPosition,
+                    audio_id: window.globalState.audio_id
+                });
             } else {
                 pushStateChange('play', {
                     audio_id: window.globalState.audio_id,

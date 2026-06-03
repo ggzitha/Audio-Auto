@@ -198,14 +198,31 @@ app.add_middleware(SessionMiddleware, secret_key="super-secret-audio-auto-key-12
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 @app.get("/audio_files/{filename:path}")
-def get_audio_file(filename: str, request: Request):
-    # Strip directory traversal and decode any remaining percent-encoding
+def get_audio_file(filename: str, request: Request, seek_sec: float = 0.0):
     safe = os.path.basename(filename)
     file_path = os.path.join("audio_files", safe)
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
 
+    # Accurate Frame-Sync Seeking via FFmpeg
+    # If the ESP32 wants to seek, calculating byte offsets is inaccurate and causes
+    # the MP3 decoder to receive partial frames (creating "zzzzzz" static noise).
+    # Instead, we use FFmpeg to instantly slice the MP3 at the exact timestamp,
+    # guaranteeing perfect frame alignment and accurate synchronization.
+    if seek_sec > 0.1:
+        import subprocess
+        cmd = ["ffmpeg", "-ss", str(seek_sec), "-i", file_path, "-c", "copy", "-f", "mp3", "pipe:1"]
+        proc = subprocess.run(cmd, capture_output=True)
+        data = proc.stdout
+        headers = {
+            "Content-Length": str(len(data)),
+            "Content-Type": "audio/mpeg",
+            "Accept-Ranges": "bytes"
+        }
+        return Response(content=data, status_code=200, headers=headers, media_type="audio/mpeg")
+
     file_size = os.path.getsize(file_path)
+
     range_header = request.headers.get("Range")
 
     if not range_header:
@@ -216,6 +233,7 @@ def get_audio_file(filename: str, request: Request):
         }
         return FileResponse(file_path, headers=headers, media_type="audio/mpeg")
 
+    # Manually handle Range to ensure 206 Partial Content without Chunked Encoding
     range_match = range_header.replace("bytes=", "").split("-")
     start = int(range_match[0]) if range_match[0] else 0
     end = int(range_match[1]) if len(range_match) > 1 and range_match[1] else file_size - 1
@@ -225,16 +243,9 @@ def get_audio_file(filename: str, request: Request):
 
     chunk_size = end - start + 1
 
-    def file_iterator():
-        with open(file_path, "rb") as f:
-            f.seek(start)
-            bytes_left = chunk_size
-            while bytes_left > 0:
-                chunk = f.read(min(bytes_left, 65536))
-                if not chunk:
-                    break
-                bytes_left -= len(chunk)
-                yield chunk
+    with open(file_path, "rb") as f:
+        f.seek(start)
+        data = f.read(chunk_size)
 
     headers = {
         "Content-Range": f"bytes {start}-{end}/{file_size}",
@@ -243,7 +254,7 @@ def get_audio_file(filename: str, request: Request):
         "Content-Type": "audio/mpeg"
     }
 
-    return StreamingResponse(file_iterator(), status_code=206, headers=headers)
+    return Response(content=data, status_code=206, headers=headers, media_type="audio/mpeg")
 
 templates = Jinja2Templates(directory="app/templates")
 
@@ -557,6 +568,8 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
             cmd = ["ffmpeg", "-y", "-i", orig_path,
                    "-ar", c_samplerate,
                    "-ac", "2",            # stereo — helix decoder expects stereo
+                   "-vn",                 # absolutely critical: strip album art (video stream) 
+                                          # because ESP32's Helix decoder crashes on large PNG/JPEG tags
                    "-map_metadata", "-1", # strip ID3/metadata tags — large tags
                                            # can corrupt helix frame-sync on ESP32
                    ]
@@ -780,7 +793,13 @@ def realtime_stop(device_name: str = Form("all"), clear: bool = Form(False), use
     return {"message": "Stop command sent"}
 
 @app.post("/api/seek")
-def realtime_seek(device_name: str = Form("all"), position: float = Form(...), user=Depends(require_auth)):
+def realtime_seek(
+    device_name: str = Form("all"), 
+    position: float = Form(...),
+    audio_id: int = Form(None),
+    db: Session = Depends(database.get_db),
+    user=Depends(require_auth)
+):
     # 300ms sync window: enough for MQTT to reach all ESP32s before they seek,
     # but imperceptible to the human ear (vs. 1s which is very noticeable).
     sync_delay = 0.3
@@ -790,6 +809,12 @@ def realtime_seek(device_name: str = Form("all"), position: float = Form(...), u
         "position": position,
         "start_time": start_time
     }
+
+    if audio_id:
+        audio = db.query(models.AudioFile).filter(models.AudioFile.id == audio_id).first()
+        if audio:
+            cmd["url"] = audio_url("192.168.88.8:9876", audio.filename)
+            cmd["bitrate_kbps"] = _calc_bitrate_kbps(audio.filename, audio.duration_sec)
 
     global global_state
     global_state.position = position

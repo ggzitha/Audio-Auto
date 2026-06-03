@@ -111,6 +111,7 @@ AudioState   state           = IDLE;
 String       pendingUrl      = "";
 double       syncStartTime   = 0;
 float        pendingPosition = 0.0f;
+int          pendingBitrateKbps = 128;
 int          currentVolume   = 80;   // 0–100 %
 
 unsigned long lastTelemetry = 0;
@@ -140,7 +141,7 @@ void stopAudio() {
  * seekSec — approximate position in seconds (byte-offset via Range header).
  * volPct  — 0–100.
  */
-void startStream(const String& url, float seekSec, int volPct) {
+void startStream(const String& url, float seekSec, int volPct, int bitrateKbps) {
     stopAudio();
     Serial.printf("[Stream] %s  pos=%.1fs  vol=%d%%\n",
                   url.c_str(), seekSec, volPct);
@@ -153,22 +154,26 @@ void startStream(const String& url, float seekSec, int volPct) {
     }
     i2sOut->SetGain(volPct / 100.0f);   // 0.0–1.0
 
+    // Accurate Frame-Sync Seek: instead of guessing byte offsets which causes
+    // static noise, we pass the time offset to the server. The server instantly
+    // slices the MP3 using FFmpeg and returns a clean stream.
+    String finalUrl = url;
+    if (seekSec > 0.1f) {
+        if (finalUrl.indexOf("?") == -1) {
+            finalUrl += "?seek_sec=" + String(seekSec, 2);
+        } else {
+            finalUrl += "&seek_sec=" + String(seekSec, 2);
+        }
+        Serial.printf("[Seek] Requesting exact time offset: %.2fs\n", seekSec);
+    }
+
     // Open HTTP stream
-    http = new AudioFileSourceHTTPStream(url.c_str());
+    http = new AudioFileSourceHTTPStream(finalUrl.c_str());
     if (!http->isOpen()) {
-        logMsg("ERROR: HTTP open failed: " + url);
+        logMsg("ERROR: HTTP open failed: " + finalUrl);
         delete http; http = nullptr;
         state = IDLE;
         return;
-    }
-
-    // Approximate seek — byte offset at ~128 kbps = 16 000 B/s
-    // seek() re-issues the HTTP request with Range: bytes=N-
-    if (seekSec > 1.0f) {
-        uint32_t byteOffset = (uint32_t)(seekSec * 16000.0f);
-        if (!http->seek(byteOffset, SEEK_SET)) {
-            Serial.printf("[Stream] seek unsupported, drift %.1fs\n", seekSec);
-        }
     }
 
     // 8 KB buffer — pre-fetches HTTP data so the decoder never sees TCP starvation
@@ -263,6 +268,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
         pendingUrl      = doc["url"] | "";
         syncStartTime   = doc["start_time"].as<double>();
         pendingPosition = doc["position"] | 0.0f;
+        pendingBitrateKbps = doc["bitrate_kbps"] | 128;
         currentVolume   = constrain((int)(doc["volume"] | 80), 0, 100);
         stopAudio();
         state = WAITING_SYNC;
@@ -284,7 +290,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
             stopAudio();
             state = WAITING_SYNC;
         } else {
-            if (pendingUrl.length() > 0) startStream(pendingUrl, pos, currentVolume);
+            if (pendingUrl.length() > 0) startStream(pendingUrl, pos, currentVolume, doc["bitrate_kbps"] | 128);
         }
         logMsg("CMD seek → " + String(pos, 2));
     }
@@ -387,7 +393,7 @@ void loop() {
         if (fire) {
             syncStartTime = 0;
             if (pendingUrl.length() > 0)
-                startStream(pendingUrl, pendingPosition, currentVolume);
+                startStream(pendingUrl, pendingPosition, currentVolume, pendingBitrateKbps);
             pendingPosition = 0.0f;
         }
     }
