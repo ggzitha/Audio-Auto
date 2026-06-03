@@ -13,7 +13,9 @@ document.addEventListener('DOMContentLoaded', () => {
         is_playing: false,
         position: 0,       // position at last_updated
         volume: 50,
+        previousVolume: 50,
         speed: 1.0,
+        deviceLogs: {},    // Persist logs across SPA navigations
         last_updated: 0,   // server unix timestamp when position was captured
         server_time: 0,    // server's clock at time of broadcast
         current_position: 0
@@ -118,6 +120,10 @@ document.addEventListener('DOMContentLoaded', () => {
             try {
                 const data = JSON.parse(event.data);
                 if (data.type === 'log') {
+                    if (!window.globalState.deviceLogs) window.globalState.deviceLogs = {};
+                    if (!window.globalState.deviceLogs[data.device]) window.globalState.deviceLogs[data.device] = [];
+                    window.globalState.deviceLogs[data.device].push(`[${new Date().toLocaleTimeString()}] ${data.text}`);
+                    if (window.globalState.deviceLogs[data.device].length > 50) window.globalState.deviceLogs[data.device].shift();
                     window.dispatchEvent(new CustomEvent('deviceLog', { detail: data }));
                 } else if (data.type === 'state') {
                     applyServerState(data.state);
@@ -416,6 +422,22 @@ document.addEventListener('DOMContentLoaded', () => {
         window.selectSong(window.allFiles[idx].id);
     }
 
+    function stopPlayback() {
+        if (!window.globalState.audio_id) return;
+        pushStateChange('stop', {});
+        setTimeout(() => pushStateChange('seek', { position: 0 }), 100);
+    }
+
+    function toggleMute() {
+        const state = window.globalState;
+        if (state.volume > 0) {
+            state.previousVolume = state.volume;
+            pushStateChange('volume', { volume: 0 });
+        } else {
+            pushStateChange('volume', { volume: state.previousVolume || 50 });
+        }
+    }
+
     // ─── WaveSurfer Initialization ────────────────────────────────────────────
     function initWaveSurfer() {
         const container = document.getElementById('waveformContainer');
@@ -464,6 +486,16 @@ document.addEventListener('DOMContentLoaded', () => {
             if (timeTotal) timeTotal.innerText = formatTime(dur);
             if (miniTimeTotal) miniTimeTotal.innerText = formatTime(dur);
 
+            // Update duration in the playlist if it was 0
+            if (window.globalState.audio_id) {
+                const fileObj = window.allFiles.find(f => f.id === window.globalState.audio_id);
+                if (fileObj && (!fileObj.duration_sec || fileObj.duration_sec === 0)) {
+                    fileObj.duration_sec = dur;
+                    const el = document.querySelector(`#playlistContainer > div[data-id="${fileObj.id}"] p`);
+                    if (el) el.innerText = formatTime(dur);
+                }
+            }
+
             // Seek to synced position when waveform loads
             const syncPos = window.globalState.current_position || window.globalState.position;
             if (syncPos > 0 && dur > 0) {
@@ -506,6 +538,19 @@ document.addEventListener('DOMContentLoaded', () => {
                 });
             }
         });
+
+        // If audio is already loaded, update UI immediately
+        if (wavesurfer.getDuration && wavesurfer.getDuration() > 0) {
+            const dur = wavesurfer.getDuration();
+            const timeTotal = document.getElementById('timeTotal');
+            if (timeTotal) timeTotal.innerText = formatTime(dur);
+            if (miniTimeTotal) miniTimeTotal.innerText = formatTime(dur);
+            
+            const timeElapsed = document.getElementById('timeElapsed');
+            const currentT = wavesurfer.getCurrentTime();
+            if (timeElapsed) timeElapsed.innerText = formatTime(currentT);
+            if (miniTimeElapsed) miniTimeElapsed.innerText = formatTime(currentT);
+        }
     }
 
     // ─── Page Scripts ─────────────────────────────────────────────────────────
@@ -522,10 +567,15 @@ document.addEventListener('DOMContentLoaded', () => {
         // Bind player controls
         const btnPlay = document.getElementById('btnPlay');
         if (btnPlay) btnPlay.addEventListener('click', togglePlay);
+        const btnStop = document.getElementById('btnStop');
+        if (btnStop) btnStop.addEventListener('click', stopPlayback);
         const btnNext = document.getElementById('btnNext');
         if (btnNext) btnNext.addEventListener('click', playNext);
         const btnPrev = document.getElementById('btnPrev');
         if (btnPrev) btnPrev.addEventListener('click', playPrev);
+
+        const volIcon = document.getElementById('volIcon');
+        if (volIcon) volIcon.addEventListener('click', toggleMute);
 
         const volSlider = document.getElementById('volSlider');
         if (volSlider) {
@@ -677,26 +727,43 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (!card) {
                         card = document.createElement('div');
                         card.id = 'card-' + d.name;
-                        card.className = 'glass rounded-2xl p-6 shadow-lg flex flex-col h-96';
                         grid.appendChild(card);
                     }
-                    // Preserve existing terminal log content
-                    const existingLog = document.getElementById('term-' + d.name);
-                    const existingLogContent = existingLog ? existingLog.innerHTML : '<div>--- Terminal Logs ---</div>';
+                    card.className = `glass rounded-2xl p-6 shadow-lg flex flex-col h-96 transition-all duration-300 ${!isOnline ? 'opacity-50 grayscale' : ''}`;
+                    const logs = window.globalState.deviceLogs && window.globalState.deviceLogs[d.name] 
+                        ? window.globalState.deviceLogs[d.name].map(l => `<div>${l}</div>`).join('') 
+                        : '<div>--- Terminal Logs ---</div>';
+                        
+                    // Format date to DD-MMMM-YYYY hh:mm:ss
+                    let dateStr = 'N/A';
+                    if (d.last_seen) {
+                        const dObj = new Date(d.last_seen);
+                        if (!isNaN(dObj.getTime())) {
+                            const day = String(dObj.getDate()).padStart(2, '0');
+                            const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+                            const month = months[dObj.getMonth()];
+                            const year = dObj.getFullYear();
+                            const hrs = String(dObj.getHours()).padStart(2, '0');
+                            const mins = String(dObj.getMinutes()).padStart(2, '0');
+                            const secs = String(dObj.getSeconds()).padStart(2, '0');
+                            dateStr = `${day}-${month}-${year} ${hrs}:${mins}:${secs}`;
+                        }
+                    }
+
                     card.innerHTML = `
                         <div class="flex justify-between items-start mb-2 shrink-0">
                             <h3 class="text-lg font-bold flex items-center"><i class="fas fa-microchip text-primary mr-2"></i> ${d.name}</h3>
                             <span class="flex items-center text-xs px-2 py-1 rounded-full ${isOnline ? 'bg-green-900/30 text-green-400' : 'bg-red-900/30 text-red-400'}">
-                                ${d.status.toUpperCase()}
+                                ${(d.status || 'offline').toUpperCase()}
                             </span>
                         </div>
                         <div class="text-xs text-gray-400 mb-2 space-y-1">
                             <div><i class="fas fa-network-wired w-4"></i> IP: ${d.ip_address || 'N/A'}</div>
                             <div><i class="fas fa-wifi w-4"></i> Signal: ${d.rssi ? d.rssi + ' dBm' : 'N/A'}</div>
                             <div><i class="fas fa-thermometer-half w-4"></i> Temp: ${d.temperature ? d.temperature + '°C' : 'N/A'}</div>
-                            <div><i class="fas fa-clock w-4"></i> Last seen: ${d.last_seen ? new Date(d.last_seen + 'Z').toLocaleTimeString() : 'N/A'}</div>
+                            <div><i class="fas fa-clock w-4"></i> Last seen: ${dateStr}</div>
                         </div>
-                        <div class="flex-1 bg-black text-green-400 font-mono text-xs p-2 rounded overflow-y-auto" id="term-${d.name}">${existingLogContent}</div>
+                        <div class="flex-1 bg-black text-green-400 font-mono text-xs p-2 rounded overflow-y-auto" id="term-${d.name}">${logs}</div>
                     `;
                 });
             });
@@ -948,8 +1015,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // ─── Mini Player Controls ─────────────────────────────────────────────────
     if (miniBtnPlay) miniBtnPlay.addEventListener('click', togglePlay);
+    const miniBtnStop = document.getElementById('miniBtnStop');
+    if (miniBtnStop) miniBtnStop.addEventListener('click', stopPlayback);
     if (miniBtnNext) miniBtnNext.addEventListener('click', playNext);
     if (miniBtnPrev) miniBtnPrev.addEventListener('click', playPrev);
+
+    const miniVolIcon = document.getElementById('miniVolIcon');
+    if (miniVolIcon) miniVolIcon.addEventListener('click', toggleMute);
 
     if (miniVolSlider) {
         miniVolSlider.addEventListener('input', e => {

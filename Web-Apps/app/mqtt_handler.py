@@ -27,7 +27,7 @@ def on_message(client, userdata, msg):
             parts = topic.split("/")
             if len(parts) >= 3:
                 device_name = parts[2]
-                payload_str = msg.payload.decode()
+                payload_str = msg.payload.decode(errors='ignore')
                 if on_log_callback:
                     on_log_callback(device_name, payload_str)
             return

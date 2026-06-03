@@ -350,7 +350,7 @@ void setup() {
     Serial.begin(115200);
     delay(800);
     Serial.printf("\n╔══════════════════════════════════╗\n"
-                  "║  Audio-Auto  %-10s v3.0   ║\n"
+                  "║  Audio-Auto  %-10s v3.0          ║\n"
                   "╚══════════════════════════════════╝\n", CHIP_NAME);
     Serial.println(DEVICE_NAME);
 
@@ -374,6 +374,7 @@ void setup() {
     connectMQTT();
 
     Serial.println("Ready!\n");
+    logMsg("Device Booted and Ready!");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

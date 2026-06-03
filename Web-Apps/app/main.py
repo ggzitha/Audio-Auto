@@ -436,7 +436,34 @@ def get_global_state():
 @app.get("/api/devices")
 def get_devices(db: Session = Depends(database.get_db), user=Depends(require_auth)):
     devices = db.query(models.Device).all()
-    return devices
+    now = datetime.utcnow()
+    result = []
+    for d in devices:
+        if d.name == "Web App":
+            result.append({
+                "id": d.id, "name": d.name, "ip_address": d.ip_address,
+                "status": d.status, "rssi": d.rssi, "temperature": d.temperature,
+                "last_seen": d.last_seen.isoformat() + "Z" if d.last_seen else None
+            })
+            continue
+            
+        if d.last_seen:
+            diff = now - d.last_seen
+            if diff.total_seconds() > 3 * 24 * 3600:
+                # Older than 3 days, permanently delete
+                db.delete(d)
+                continue
+            elif diff.total_seconds() > 2 * 3600:
+                # Older than 2 hours, mark as offline
+                d.status = "offline"
+                
+        result.append({
+            "id": d.id, "name": d.name, "ip_address": d.ip_address,
+            "status": d.status, "rssi": d.rssi, "temperature": d.temperature,
+            "last_seen": d.last_seen.isoformat() + "Z" if d.last_seen else None
+        })
+    db.commit()
+    return result
 
 
 @app.delete("/api/files/{file_id}")

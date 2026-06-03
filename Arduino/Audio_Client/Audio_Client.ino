@@ -336,6 +336,7 @@ void setup() {
     connectMQTT();
 
     Serial.println("Ready!\n");
+    logMsg("Device Booted and Ready!");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
