@@ -18,6 +18,7 @@ def on_connect(client, userdata, flags, rc):
     print(f"Connected to MQTT broker with result code {rc}")
     client.subscribe("audioauto/telemetry/#")
     client.subscribe("audioauto/log/#")
+    client.subscribe("audioauto/sync_request/#")
 
 def on_message(client, userdata, msg):
     try:
@@ -30,6 +31,37 @@ def on_message(client, userdata, msg):
                 payload_str = msg.payload.decode(errors='ignore')
                 if on_log_callback:
                     on_log_callback(device_name, payload_str)
+            return
+
+        if topic.startswith("audioauto/sync_request/"):
+            parts = topic.split("/")
+            if len(parts) >= 3:
+                device_name = parts[2]
+                from .main import global_state, get_current_position
+                from .database import SessionLocal
+                from .models import AudioFile
+                import time
+                
+                if global_state.is_playing and global_state.audio_id:
+                    db = SessionLocal()
+                    try:
+                        audio = db.query(AudioFile).filter(AudioFile.id == global_state.audio_id).first()
+                        if audio:
+                            url = f"http://{MQTT_BROKER}:9876/audio_files/{audio.filename}"
+                            start_time = int(time.time()) + 1
+                            current_pos = get_current_position()
+                            cmd = {
+                                "action": "play",
+                                "url": url,
+                                "start_time": start_time,
+                                "volume": global_state.volume,
+                                "position": current_pos,
+                            }
+                            publish_command(device_name, cmd)
+                    except Exception as e:
+                        print(f"Error sending sync state: {e}")
+                    finally:
+                        db.close()
             return
 
         payload = json.loads(msg.payload.decode())

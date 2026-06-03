@@ -232,6 +232,11 @@ void connectMQTT() {
             mqtt.subscribe(("audioauto/commands/" + String(DEVICE_NAME)).c_str(), 1);
             mqtt.subscribe("audioauto/commands/all", 1);
             registerDevice();
+            
+            // Ask server for current playing state so we jump in if late
+            String syncReqTopic = "audioauto/sync_request/" + String(DEVICE_NAME);
+            mqtt.publish(syncReqTopic.c_str(), "boot");
+            
             logMsg("Device online: " + String(DEVICE_NAME));
         } else {
             Serial.printf("fail(%d) retry\n", mqtt.state());
