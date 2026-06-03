@@ -130,8 +130,8 @@ void logMsg(const String& msg) {
 void stopAudio() {
     if (mp3 && mp3->isRunning()) mp3->stop();
     delete mp3;    mp3    = nullptr;
-    delete source; source = nullptr;
-    delete http;   http   = nullptr;
+    if (source) { source->close(); delete source; source = nullptr; }
+    if (http)   { http->close();   delete http;   http   = nullptr; }
     state = IDLE;
 }
 

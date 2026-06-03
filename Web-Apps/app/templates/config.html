@@ -37,6 +37,48 @@
                     <option value="id">Bahasa Indonesia</option>
                 </select>
             </div>
+
+            <!-- Transcoding Settings -->
+            <div class="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700">
+                <h4 class="font-semibold text-gray-800 dark:text-gray-200 mb-4">Transcoding (Upload)</h4>
+                <div class="flex items-center mb-4">
+                    <input type="checkbox" id="cfgTcEnable" name="transcode_enabled" class="w-4 h-4 text-primary bg-gray-100 border-gray-300 rounded focus:ring-primary dark:bg-gray-700 dark:border-gray-600">
+                    <label for="cfgTcEnable" class="ml-2 text-sm font-medium text-gray-700 dark:text-gray-300">Transcode after upload</label>
+                </div>
+
+                <div id="cfgTcOptions" class="space-y-4 hidden pl-6 border-l-2 border-primary/30">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Audio Options</label>
+                        <select id="cfgTcType" name="transcode_type" class="w-full bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 focus:ring-primary outline-none text-sm">
+                            <option value="lossy">Lossy (Smaller size)</option>
+                            <option value="lossless">Lossless (High quality)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Output Format</label>
+                        <select id="cfgTcFormat" name="transcode_format" class="w-full bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 focus:ring-primary outline-none text-sm">
+                            <!-- Populated dynamically -->
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Bitrate / Depth</label>
+                        <select id="cfgTcBitrate" name="transcode_bitrate" class="w-full bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 focus:ring-primary outline-none text-sm">
+                            <!-- Populated dynamically -->
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Sample Rate (Max 48kHz for ESP32)</label>
+                        <select id="cfgTcSampleRate" name="transcode_samplerate" class="w-full bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 focus:ring-primary outline-none text-sm">
+                            <option value="16000">16 KHz</option>
+                            <option value="22050">22.05 KHz</option>
+                            <option value="32000">32 KHz</option>
+                            <option value="44100" selected>44.1 KHz</option>
+                            <option value="48000">48 KHz</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+
             <div class="pt-4 flex justify-end">
                 <button type="submit" class="px-6 py-2 rounded-lg text-white bg-primary hover:bg-blue-600 transition-colors font-semibold" data-i18n="save">Save Changes</button>
             </div>

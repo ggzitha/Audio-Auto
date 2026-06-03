@@ -51,3 +51,10 @@ class SystemConfig(Base):
     default_volume = Column(Integer, default=50)
     timezone = Column(String(50), default="Asia/Jayapura")
     language = Column(String(10), default="en")
+    
+    # Transcoding settings
+    transcode_enabled = Column(Boolean, default=False)
+    transcode_type = Column(String(20), default="lossy")
+    transcode_format = Column(String(10), default="mp3")
+    transcode_bitrate = Column(String(20), default="128k")
+    transcode_samplerate = Column(String(20), default="44100")

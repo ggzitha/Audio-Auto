@@ -16,6 +16,7 @@ document.addEventListener('DOMContentLoaded', () => {
         previousVolume: 50,
         speed: 1.0,
         deviceLogs: {},    // Persist logs across SPA navigations
+        autoScroll: {},    // Auto-scroll state per device
         last_updated: 0,   // server unix timestamp when position was captured
         server_time: 0,    // server's clock at time of broadcast
         current_position: 0
@@ -125,6 +126,21 @@ document.addEventListener('DOMContentLoaded', () => {
                     window.globalState.deviceLogs[data.device].push(`[${new Date().toLocaleTimeString()}] ${data.text}`);
                     if (window.globalState.deviceLogs[data.device].length > 50) window.globalState.deviceLogs[data.device].shift();
                     window.dispatchEvent(new CustomEvent('deviceLog', { detail: data }));
+                } else if (data.type === 'transcode_progress') {
+                    if (data.status === 'started') {
+                        Swal.fire({
+                            title: 'Transcoding Audio',
+                            html: `<div class="text-sm mb-4">Processing <b>${data.file}</b>...</div><div class="flex justify-center"><i class="fas fa-cog fa-spin text-4xl text-primary"></i></div>`,
+                            allowOutsideClick: false,
+                            showConfirmButton: false,
+                            customClass: { popup: 'glass' }
+                        });
+                    } else if (data.status === 'done') {
+                        Swal.fire({ toast: true, position: 'top-end', icon: 'success', title: 'Transcoding complete', text: data.file, showConfirmButton: false, timer: 3000, customClass: { popup: 'glass' } });
+                        fetch('/api/files').then(r => r.json()).then(files => { window.allFiles = files; renderPlaylist(files); });
+                    } else if (data.status === 'error') {
+                        Swal.fire('Transcode Failed', `Failed to transcode ${data.file}`, 'error');
+                    }
                 } else if (data.type === 'state') {
                     applyServerState(data.state);
                 }
@@ -306,9 +322,17 @@ document.addEventListener('DOMContentLoaded', () => {
             const fileObj = window.allFiles.find(f => f.id === state.audio_id);
             if (fileObj) {
                 if (miniSongTitle) miniSongTitle.innerText = fileObj.original_name;
-                const bigTitle = document.getElementById('currentSongTitle');
+                const bigTitle = document.getElementById('nowPlaying');
                 if (bigTitle) bigTitle.innerText = fileObj.original_name;
+                const bigArtist = document.getElementById('nowPlayingArtist');
+                if (bigArtist) bigArtist.innerText = state.is_playing ? 'Playing...' : 'Paused';
             }
+        } else {
+            const bigTitle = document.getElementById('nowPlaying');
+            if (bigTitle) bigTitle.innerText = 'Ready';
+            const bigArtist = document.getElementById('nowPlayingArtist');
+            if (bigArtist) bigArtist.innerText = 'Audio-Auto System';
+            if (miniSongTitle) miniSongTitle.innerText = 'Ready';
         }
 
         // Play/Pause icons
@@ -320,8 +344,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const bigPlayIcon = document.getElementById('playIcon');
         if (bigPlayIcon) {
             bigPlayIcon.className = state.is_playing
-                ? "fas fa-pause text-3xl md:text-4xl"
-                : "fas fa-play text-3xl md:text-4xl";
+                ? "fas fa-pause-circle text-5xl md:text-6xl drop-shadow-md"
+                : "fas fa-play-circle text-5xl md:text-6xl drop-shadow-md";
         }
 
         // Playlist highlight
@@ -424,8 +448,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function stopPlayback() {
         if (!window.globalState.audio_id) return;
-        pushStateChange('stop', {});
-        setTimeout(() => pushStateChange('seek', { position: 0 }), 100);
+        pushStateChange('stop', { clear: true });
     }
 
     function toggleMute() {
@@ -464,7 +487,6 @@ document.addEventListener('DOMContentLoaded', () => {
             container: globalWaveformContainer,
             waveColor: 'rgba(59, 130, 246, 0.4)',
             progressColor: 'rgba(59, 130, 246, 1)',
-            cursorColor: 'rgba(59, 130, 246, 1)',
             barWidth: 2,
             barGap: 2,
             barRadius: 2,
@@ -611,7 +633,7 @@ document.addEventListener('DOMContentLoaded', () => {
         // Load file list
         fetch('/api/files').then(r => r.json()).then(files => {
             window.allFiles = files;
-            renderPlaylist(files);
+            window.renderPlaylist(files);
             updateUIFromState();
         });
 
@@ -620,12 +642,12 @@ document.addEventListener('DOMContentLoaded', () => {
             searchInput.addEventListener('input', e => {
                 const q = e.target.value.toLowerCase();
                 const filtered = window.allFiles.filter(f => f.original_name.toLowerCase().includes(q));
-                renderPlaylist(filtered);
+                window.renderPlaylist(filtered);
             });
         }
 
         const playlistContainer = document.getElementById('playlistContainer');
-        function renderPlaylist(files) {
+        window.renderPlaylist = function(files) {
             if (!playlistContainer) return;
             if (files.length === 0) {
                 playlistContainer.innerHTML = '<div class="p-8 text-center text-gray-500">No audio files.</div>';
@@ -658,56 +680,18 @@ document.addEventListener('DOMContentLoaded', () => {
                 title: 'Delete file?', icon: 'warning', showCancelButton: true, confirmButtonText: 'Yes, delete it'
             }).then(res => {
                 if (res.isConfirmed) {
+                    if (window.globalState && window.globalState.audio_id === id) {
+                        pushStateChange('stop', { clear: true });
+                    }
                     fetch('/api/files/' + id, { method: 'DELETE' }).then(() => {
                         fetch('/api/files').then(r => r.json()).then(files => {
                             window.allFiles = files;
-                            renderPlaylist(files);
+                            window.renderPlaylist(files);
                         });
                     });
                 }
             });
         };
-
-        const fileInput = document.getElementById('fileInput');
-        if (fileInput) {
-            fileInput.addEventListener('change', async () => {
-                if (!fileInput.files.length) return;
-                const formData = new FormData();
-                formData.append('file', fileInput.files[0]);
-
-                const uploadStatus = document.getElementById('uploadStatus');
-                const uploadBar = document.getElementById('uploadBar');
-
-                if (uploadStatus) uploadStatus.classList.remove('hidden');
-                if (uploadBar) uploadBar.style.width = '50%';
-
-                try {
-                    const r = await fetch('/api/upload', { method: 'POST', body: formData });
-                    if (r.ok) {
-                        if (uploadBar) uploadBar.style.width = '100%';
-                        setTimeout(async () => {
-                            if (uploadStatus) uploadStatus.classList.add('hidden');
-                            if (uploadBar) uploadBar.style.width = '0%';
-                            const files = await (await fetch('/api/files')).json();
-                            window.allFiles = files;
-                            renderPlaylist(files);
-                            updateUIFromState();
-                            // Brief toast — non-blocking
-                            Swal.fire({ toast:true, position:'top-end', icon:'success',
-                                title:'Upload complete — tap a song to play',
-                                showConfirmButton:false, timer:2500, timerProgressBar:true });
-                        }, 500);
-                    } else {
-                        throw new Error('Upload failed');
-                    }
-                } catch (e) {
-                    Swal.fire('Error', e.message, 'error');
-                    if (uploadStatus) uploadStatus.classList.add('hidden');
-                }
-                // Reset input so same file can be re-uploaded
-                fileInput.value = '';
-            });
-        }
     }
 
     function initDevices() {
@@ -763,7 +747,23 @@ document.addEventListener('DOMContentLoaded', () => {
                             <div><i class="fas fa-thermometer-half w-4"></i> Temp: ${d.temperature ? d.temperature + '°C' : 'N/A'}</div>
                             <div><i class="fas fa-clock w-4"></i> Last seen: ${dateStr}</div>
                         </div>
-                        <div class="flex-1 bg-black text-green-400 font-mono text-xs p-2 rounded overflow-y-auto" id="term-${d.name}">${logs}</div>
+                        <div class="relative flex-1 mt-1 rounded bg-black overflow-hidden flex flex-col">
+                            <div class="absolute top-2 right-4 flex space-x-4 bg-black/60 px-2 py-1 rounded z-10">
+                                <button class="text-gray-400 hover:text-white transition group relative" onclick="toggleAutoScroll('${d.name}')">
+                                    <i id="icon-scroll-${d.name}" class="fas ${(!window.globalState.autoScroll || window.globalState.autoScroll[d.name] !== false) ? 'fa-lock' : 'fa-unlock'}"></i>
+                                    <div class="absolute top-full right-0 mt-2 px-3 py-1.5 text-xs glass rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-20 text-gray-800 dark:text-gray-200 font-sans font-semibold">Toggle Auto-scroll</div>
+                                </button>
+                                <button class="text-gray-400 hover:text-white transition group relative" onclick="clearLogs('${d.name}')">
+                                    <i class="fas fa-trash"></i>
+                                    <div class="absolute top-full right-0 mt-2 px-3 py-1.5 text-xs glass rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-20 text-gray-800 dark:text-gray-200 font-sans font-semibold">Clear Logs</div>
+                                </button>
+                                <button class="text-gray-400 hover:text-white transition group relative" onclick="copyLogs('${d.name}')">
+                                    <i class="fas fa-copy"></i>
+                                    <div class="absolute top-full right-0 mt-2 px-3 py-1.5 text-xs glass rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-20 text-gray-800 dark:text-gray-200 font-sans font-semibold">Copy to Clipboard</div>
+                                </button>
+                            </div>
+                            <div class="flex-1 text-green-400 font-mono text-[11px] leading-relaxed p-3 overflow-y-auto" id="term-${d.name}">${logs}</div>
+                        </div>
                     `;
                 });
             });
@@ -781,7 +781,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 const line = document.createElement('div');
                 line.textContent = `[${new Date().toLocaleTimeString()}] ${text}`;
                 term.appendChild(line);
-                term.scrollTop = term.scrollHeight;
+                if (!window.globalState.autoScroll || window.globalState.autoScroll[device] !== false) {
+                    term.scrollTop = term.scrollHeight;
+                }
             }
         });
     }
@@ -971,6 +973,35 @@ document.addEventListener('DOMContentLoaded', () => {
         const form = document.getElementById('configForm');
         if (!form) return;
 
+        // Dynamic formats based on type
+        const tcType = document.getElementById('cfgTcType');
+        const tcFormat = document.getElementById('cfgTcFormat');
+        const tcBitrate = document.getElementById('cfgTcBitrate');
+        
+        function updateTcOptions() {
+            if (!tcType || !tcFormat || !tcBitrate) return;
+            const isLossy = tcType.value === 'lossy';
+            tcFormat.innerHTML = isLossy 
+                ? '<option value="mp3">MP3</option><option value="aac">AAC</option><option value="ogg">OGG</option>'
+                : '<option value="flac">FLAC</option><option value="wav">WAV</option>';
+            tcBitrate.innerHTML = isLossy
+                ? '<option value="64k">64 kbps</option><option value="128k">128 kbps</option><option value="192k">192 kbps</option><option value="256k">256 kbps</option><option value="320k">320 kbps</option>'
+                : '<option value="16bit">16-bit</option><option value="24bit">24-bit</option>';
+        }
+
+        if (tcType) {
+            tcType.addEventListener('change', updateTcOptions);
+        }
+
+        const tcEnable = document.getElementById('cfgTcEnable');
+        const tcOptions = document.getElementById('cfgTcOptions');
+        if (tcEnable) {
+            tcEnable.addEventListener('change', (e) => {
+                if (e.target.checked) tcOptions.classList.remove('hidden');
+                else tcOptions.classList.add('hidden');
+            });
+        }
+
         fetch('/api/config').then(r => r.json()).then(conf => {
             const elVol = document.getElementById('cfgVol');
             const elTz = document.getElementById('cfgTz');
@@ -983,6 +1014,19 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             if (elTz) elTz.value = conf.timezone || 'Asia/Jayapura';
             if (elLang) elLang.value = conf.language || 'en';
+            
+            if (tcEnable) {
+                tcEnable.checked = conf.transcode_enabled || false;
+                if (conf.transcode_enabled) tcOptions.classList.remove('hidden');
+                
+                if (tcType) tcType.value = conf.transcode_type || 'lossy';
+                updateTcOptions();
+                if (tcFormat) tcFormat.value = conf.transcode_format || 'mp3';
+                if (tcBitrate) tcBitrate.value = conf.transcode_bitrate || '128k';
+                
+                const tcSampleRate = document.getElementById('cfgTcSampleRate');
+                if (tcSampleRate) tcSampleRate.value = conf.transcode_samplerate || '44100';
+            }
         });
 
         const elVol = document.getElementById('cfgVol');
@@ -999,6 +1043,14 @@ document.addEventListener('DOMContentLoaded', () => {
             formData.append('default_volume', document.getElementById('cfgVol')?.value || 50);
             formData.append('timezone', document.getElementById('cfgTz')?.value || 'Asia/Jayapura');
             formData.append('language', document.getElementById('cfgLang')?.value || 'en');
+            
+            if (tcEnable) {
+                formData.append('transcode_enabled', tcEnable.checked);
+                formData.append('transcode_type', tcType.value);
+                formData.append('transcode_format', tcFormat.value);
+                formData.append('transcode_bitrate', tcBitrate.value);
+                formData.append('transcode_samplerate', document.getElementById('cfgTcSampleRate').value);
+            }
 
             try {
                 const r = await fetch('/api/config', { method: 'POST', body: formData });
@@ -1028,9 +1080,150 @@ document.addEventListener('DOMContentLoaded', () => {
             if (localAudio) localAudio.volume = e.target.value / 100.0;
         });
         miniVolSlider.addEventListener('change', e => {
-            pushStateChange('volume', { volume: e.target.value });
+            pushStateChange('volume', { volume: parseInt(e.target.value) });
         });
     }
+
+    // ─── Terminal Controls ────────────────────────────────────────────────────
+    window.toggleAutoScroll = function(device) {
+        if (!window.globalState.autoScroll) window.globalState.autoScroll = {};
+        window.globalState.autoScroll[device] = window.globalState.autoScroll[device] === false ? true : false;
+        const icon = document.getElementById('icon-scroll-' + device);
+        if (icon) {
+            icon.className = window.globalState.autoScroll[device] ? 'fas fa-lock' : 'fas fa-unlock';
+        }
+    };
+
+    window.clearLogs = function(device) {
+        if (window.globalState.deviceLogs && window.globalState.deviceLogs[device]) {
+            window.globalState.deviceLogs[device] = [];
+        }
+        const term = document.getElementById('term-' + device);
+        if (term) term.innerHTML = '<div>--- Terminal Logs ---</div>';
+    };
+
+    window.copyLogs = function(device) {
+        const term = document.getElementById('term-' + device);
+        if (term) {
+            const text = term.innerText;
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(showCopyToast);
+            } else {
+                // Fallback for non-HTTPS (like local IP)
+                const textArea = document.createElement("textarea");
+                textArea.value = text;
+                textArea.style.position = "fixed";  // Avoid scrolling to bottom
+                document.body.appendChild(textArea);
+                textArea.focus();
+                textArea.select();
+                try {
+                    document.execCommand('copy');
+                    showCopyToast();
+                } catch (err) {
+                    console.error('Fallback: Oops, unable to copy', err);
+                }
+                document.body.removeChild(textArea);
+            }
+        }
+    };
+    
+    function showCopyToast() {
+        Swal.fire({
+            toast: true,
+            position: 'top-end',
+            icon: 'success',
+            title: 'Logs copied to clipboard!',
+            showConfirmButton: false,
+            timer: 2000,
+            customClass: { popup: 'glass' },
+            background: 'transparent'
+        });
+    }
+
+    // ─── Modal Upload ──────────────────────────────────────────────────────────
+    window.openUploadModal = function() {
+        Swal.fire({
+            title: 'Upload Music',
+            html: `
+                <div id="dropZone" class="border-2 border-dashed border-gray-300 dark:border-gray-600 rounded-xl p-8 mb-4 text-center cursor-pointer hover:border-primary transition-colors bg-white/50 dark:bg-black/30">
+                    <i class="fas fa-cloud-upload-alt text-4xl text-primary mb-2"></i>
+                    <p class="text-sm text-gray-600 dark:text-gray-400">Drag & drop audio files here<br>or click to browse</p>
+                    <p class="text-xs text-gray-500 mt-2">Supported: mp3, wav, flac, aac, ogg</p>
+                    <input type="file" id="swalFileInput" multiple accept=".mp3,.wav,.flac,.aac,.ogg" class="hidden">
+                </div>
+                <div id="swalUploadStatus" class="hidden">
+                    <div class="w-full bg-gray-200 rounded-full h-2.5 dark:bg-gray-700 mb-2">
+                        <div class="bg-primary h-2.5 rounded-full w-0 transition-all duration-300" id="swalUploadBar"></div>
+                    </div>
+                    <p class="text-xs text-center text-primary" id="swalUploadText">Uploading 0 of 0...</p>
+                </div>
+            `,
+            showConfirmButton: false,
+            showCancelButton: true,
+            cancelButtonText: 'Close',
+            customClass: { popup: 'glass' },
+            didOpen: () => {
+                const dropZone = document.getElementById('dropZone');
+                const fileInput = document.getElementById('swalFileInput');
+                const uploadStatus = document.getElementById('swalUploadStatus');
+                const uploadBar = document.getElementById('swalUploadBar');
+                const uploadText = document.getElementById('swalUploadText');
+
+                dropZone.addEventListener('click', () => fileInput.click());
+
+                ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+                    dropZone.addEventListener(eventName, preventDefaults, false);
+                });
+
+                function preventDefaults(e) { e.preventDefault(); e.stopPropagation(); }
+
+                ['dragenter', 'dragover'].forEach(eventName => {
+                    dropZone.addEventListener(eventName, () => dropZone.classList.add('border-primary', 'bg-primary/10'), false);
+                });
+
+                ['dragleave', 'drop'].forEach(eventName => {
+                    dropZone.addEventListener(eventName, () => dropZone.classList.remove('border-primary', 'bg-primary/10'), false);
+                });
+
+                dropZone.addEventListener('drop', (e) => handleFiles(e.dataTransfer.files), false);
+                fileInput.addEventListener('change', (e) => handleFiles(e.target.files), false);
+
+                async function handleFiles(files) {
+                    if (!files || files.length === 0) return;
+                    
+                    dropZone.classList.add('hidden');
+                    uploadStatus.classList.remove('hidden');
+                    
+                    let uploadedCount = 0;
+                    
+                    for (let i = 0; i < files.length; i++) {
+                        const file = files[i];
+                        uploadText.innerText = `Uploading ${i + 1} of ${files.length}: ${file.name}`;
+                        const formData = new FormData();
+                        formData.append('file', file);
+                        
+                        try {
+                            const res = await fetch('/api/upload', { method: 'POST', body: formData });
+                            if (res.ok) {
+                                uploadedCount++;
+                                uploadBar.style.width = `${((i + 1) / files.length) * 100}%`;
+                            }
+                        } catch (err) {
+                            console.error('Upload failed for', file.name, err);
+                        }
+                    }
+                    
+                    uploadText.innerText = 'Refreshing playlist...';
+                    const newFiles = await (await fetch('/api/files')).json();
+                    window.allFiles = newFiles;
+                    renderPlaylist(newFiles);
+                    updateUIFromState();
+                    
+                    Swal.close();
+                }
+            }
+        });
+    };
 
     if (miniProgressBarContainer) {
         miniProgressBarContainer.addEventListener('click', (e) => {

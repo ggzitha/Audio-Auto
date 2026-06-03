@@ -453,8 +453,8 @@ def get_devices(db: Session = Depends(database.get_db), user=Depends(require_aut
                 # Older than 3 days, permanently delete
                 db.delete(d)
                 continue
-            elif diff.total_seconds() > 2 * 3600:
-                # Older than 2 hours, mark as offline
+            elif diff.total_seconds() > 1 * 3600:
+                # Older than 1 hours, mark as offline
                 d.status = "offline"
                 
         result.append({
@@ -491,8 +491,10 @@ def get_files(db: Session = Depends(database.get_db), user=Depends(require_auth)
     files = db.query(models.AudioFile).all()
     return files
 
+from fastapi import BackgroundTasks
+
 @app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...), db: Session = Depends(database.get_db), user=Depends(require_auth)):
+async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...), db: Session = Depends(database.get_db), user=Depends(require_auth)):
     allowed_extensions = ["mp3", "wav", "flac", "aac", "ogg"]
     ext = file.filename.rsplit(".", 1)[-1].lower() if '.' in file.filename else ''
     if ext not in allowed_extensions:
@@ -505,12 +507,89 @@ async def upload_file(file: UploadFile = File(...), db: Session = Depends(databa
 
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
+        
+    duration_sec = 0.0
+    import subprocess
+    try:
+        res = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path],
+            capture_output=True, text=True, check=True
+        )
+        duration_sec = float(res.stdout.strip())
+    except Exception as e:
+        print("Failed to get duration:", e)
 
-    # Store original_name for display, sanitised filename for serving
-    audio = models.AudioFile(filename=filename, original_name=file.filename)
+    audio = models.AudioFile(filename=filename, original_name=file.filename, duration_sec=duration_sec)
     db.add(audio)
     db.commit()
     db.refresh(audio)
+
+    conf = db.query(models.SystemConfig).first()
+    if conf and conf.transcode_enabled:
+        # Define background task
+        def transcode_audio(audio_id: int, orig_path: str, orig_name: str, c_format: str, c_type: str, c_samplerate: str, c_bitrate: str):
+            target_ext = c_format.lower()
+            if target_ext not in ["mp3", "aac", "ogg", "flac", "wav"]:
+                target_ext = "mp3"
+                
+            tc_filename = f"{orig_name.rsplit('.', 1)[0]}_tc.{target_ext}"
+            tc_path = os.path.join("audio_files", tc_filename)
+            
+            cmd = ["ffmpeg", "-y", "-i", orig_path, "-ar", c_samplerate]
+            if c_type == "lossy":
+                bitrate = c_bitrate if "k" in c_bitrate else c_bitrate + "k"
+                cmd.extend(["-b:a", bitrate])
+            elif c_type == "lossless":
+                if target_ext == "wav":
+                    cmd.extend(["-c:a", "pcm_s" + c_bitrate.replace("bit", "") + "le"])
+                elif target_ext == "flac":
+                    cmd.extend(["-c:a", "flac"])
+            cmd.append(tc_path)
+            
+            # Broadcast start
+            global main_loop
+            if main_loop and main_loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    manager.broadcast({"type": "transcode_progress", "status": "started", "file": orig_name}),
+                    main_loop
+                )
+            
+            try:
+                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if os.path.exists(orig_path):
+                    os.remove(orig_path)
+                
+                # Update DB
+                db_sess = database.SessionLocal()
+                try:
+                    db_audio = db_sess.query(models.AudioFile).filter(models.AudioFile.id == audio_id).first()
+                    if db_audio:
+                        db_audio.filename = tc_filename
+                        db_sess.commit()
+                finally:
+                    db_sess.close()
+                
+                # Broadcast done
+                if main_loop and main_loop.is_running():
+                    asyncio.run_coroutine_threadsafe(
+                        manager.broadcast({"type": "transcode_progress", "status": "done", "file": orig_name}),
+                        main_loop
+                    )
+            except subprocess.CalledProcessError:
+                # Broadcast error
+                if main_loop and main_loop.is_running():
+                    asyncio.run_coroutine_threadsafe(
+                        manager.broadcast({"type": "transcode_progress", "status": "error", "file": orig_name}),
+                        main_loop
+                    )
+
+        background_tasks.add_task(
+            transcode_audio, 
+            audio.id, file_path, filename, 
+            conf.transcode_format, conf.transcode_type, 
+            conf.transcode_samplerate, conf.transcode_bitrate
+        )
+
     return {"message": "File uploaded successfully", "file": audio}
 
 class ScheduleRequest(BaseModel):
@@ -640,7 +719,7 @@ def realtime_play(
     return {"message": "Play command sent", "start_time": start_time}
 
 @app.post("/api/stop")
-def realtime_stop(device_name: str = Form("all"), user=Depends(require_auth)):
+def realtime_stop(device_name: str = Form("all"), clear: bool = Form(False), user=Depends(require_auth)):
     cmd = {"action": "stop"}
 
     global global_state
@@ -648,6 +727,10 @@ def realtime_stop(device_name: str = Form("all"), user=Depends(require_auth)):
     global_state.position = get_current_position()
     global_state.is_playing = False
     global_state.last_updated = time.time()
+    
+    if clear:
+        global_state.audio_id = None
+        global_state.position = 0.0
 
     broadcast_state()
     mqtt_handler.publish_command(device_name, cmd)
@@ -734,6 +817,12 @@ async def update_config(request: Request, db: Session = Depends(database.get_db)
     conf.default_volume = int(form.get("default_volume", 50))
     conf.timezone = form.get("timezone", "UTC")
     conf.language = form.get("language", "en")
+    
+    conf.transcode_enabled = form.get("transcode_enabled") == "true"
+    conf.transcode_type = form.get("transcode_type", "lossy")
+    conf.transcode_format = form.get("transcode_format", "mp3")
+    conf.transcode_bitrate = form.get("transcode_bitrate", "128k")
+    conf.transcode_samplerate = form.get("transcode_samplerate", "44100")
     db.commit()
     return {"status": "ok"}
 
