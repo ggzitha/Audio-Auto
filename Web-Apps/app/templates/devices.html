@@ -8,26 +8,215 @@
         <h2 class="text-3xl font-bold" data-i18n="devices">Devices</h2>
     </div>
 
+    <style>
+      .timing-viz { background: #1e293b; border-radius: 12px; padding: 20px; color: #fff; font-family: sans-serif; margin-bottom: 24px; border: 1px solid #334155; }
+      .timing-viz__head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+      .timing-viz__head h4 { margin: 0; font-size: 1.1rem; font-weight: 600; }
+      .timing-viz__readout { font-size: 0.9rem; color: #10b981; background: rgba(16, 185, 129, 0.1); padding: 4px 10px; border-radius: 20px; font-weight: 500; }
+      .room-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
+      .room-row:last-child { border-bottom: none; padding-bottom: 0; }
+      .room-row__name { font-weight: 500; flex: 1; }
+      .room-row__pulse { width: 8px; height: 8px; border-radius: 50%; background: #10b981; margin: 0 15px; position: relative; }
+      .room-row__beat { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border-radius: 50%; border: 2px solid #10b981; animation: pulse 1.5s infinite; }
+      @keyframes pulse { 0% { transform: scale(1); opacity: 1; } 100% { transform: scale(3); opacity: 0; } }
+      .room-row__meta { font-family: monospace; color: #94a3b8; font-size: 0.9rem; width: 60px; text-align: right; }
+      
+      .demo-card__sync { background: #1e293b; border-radius: 12px; padding: 20px; color: #fff; margin-bottom: 24px; border: 1px solid #334155; }
+      .demo-card__sync-head { display: flex; justify-content: space-between; margin-bottom: 15px; }
+      .demo-card__sync-title { font-weight: 600; font-size: 1.1rem; }
+      .demo-card__sync-readout { font-family: monospace; color: #3b82f6; }
+      .demo-card__sync-graph-shell { background: #0f172a; border-radius: 8px; padding: 10px; overflow: hidden; }
+      .demo-card__sync-graph { width: 100%; height: 120px; }
+    </style>
+
+    <div class="timing-viz" id="timingViz">
+        <div class="timing-viz__head">
+          <h4>Live timing</h4>
+          <span class="timing-viz__readout" id="timingReadout">±0.0 ms · 0 rooms</span>
+        </div>
+        <div id="timingRooms">
+            <!-- Rooms injected here -->
+        </div>
+    </div>
+
+    <div id="sendspin-demo-sync-panel" class="demo-card__sync" aria-hidden="true">
+        <div class="demo-card__sync-head">
+          <span class="demo-card__sync-title">Synchronization</span>
+          <span id="sendspin-demo-sync-status" class="demo-card__sync-readout sync-idle">0.0 ms</span>
+        </div>
+        <div id="sendspin-demo-sync-graph-shell" class="demo-card__sync-graph-shell sync-idle">
+          <canvas id="sendspin-demo-sync-graph" class="demo-card__sync-graph" aria-label="Synchronization graph" width="549" height="175"></canvas>
+        </div>
+    </div>
+
     <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6" id="deviceGrid">
         <!-- Devices injected via JS -->
     </div>
 </div>
 
 <script>
-// SPA handles fetching devices. We just need to handle the log events here.
+// ─── Device log handler ──────────────────────────────────────────────────────
 window.addEventListener('deviceLog', function(e) {
     const data = e.detail;
-    if(data.device === 'Web App') return;
-    
+    if (data.device === 'Web App') return;
     const term = document.getElementById('term-' + data.device);
-    if(term) {
+    if (term) {
         const line = document.createElement('div');
         line.innerText = data.msg;
         term.appendChild(line);
-        // keep max 50 lines
-        if(term.children.length > 50) term.removeChild(term.firstChild);
+        if (term.children.length > 50) term.removeChild(term.firstChild);
         term.scrollTop = term.scrollHeight;
     }
 });
+
+// ─── Sync chart — real data ──────────────────────────────────────────────────
+const HISTORY_LEN = 60;   // samples (= 60 seconds at 1 Hz)
+const deviceHistory = {}; // { name: [rtt_us, ...] }
+const COLORS = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4'];
+
+let graphCtx = null;
+let lastClients = [];
+
+function ensureHistory(name) {
+    if (!deviceHistory[name]) {
+        deviceHistory[name] = Array(HISTORY_LEN).fill(null);
+    }
+}
+
+function pushHistory(name, value) {
+    ensureHistory(name);
+    deviceHistory[name].push(value);
+    if (deviceHistory[name].length > HISTORY_LEN)
+        deviceHistory[name].shift();
+}
+
+function drawGraph() {
+    const canvas = document.getElementById('sendspin-demo-sync-graph');
+    if (!canvas) return;
+    if (!graphCtx) graphCtx = canvas.getContext('2d');
+
+    const w = canvas.width, h = canvas.height;
+    graphCtx.clearRect(0, 0, w, h);
+
+    // Grid lines at 0.5 ms, 1 ms, 2 ms
+    const gridMs = [0.5, 1, 2];
+    graphCtx.font = '10px monospace';
+    graphCtx.fillStyle = 'rgba(148,163,184,0.6)';
+    gridMs.forEach(ms => {
+        const us = ms * 1000;
+        const y = h/2 - (us / 3000) * (h/2 - 8);
+        if (y < 4 || y > h - 4) return;
+        graphCtx.beginPath();
+        graphCtx.strokeStyle = 'rgba(255,255,255,0.08)';
+        graphCtx.moveTo(0, y); graphCtx.lineTo(w, y);
+        graphCtx.stroke();
+        graphCtx.fillText(ms + 'ms', 2, y - 2);
+    });
+
+    // Center baseline
+    graphCtx.beginPath();
+    graphCtx.strokeStyle = 'rgba(255,255,255,0.15)';
+    graphCtx.setLineDash([4, 4]);
+    graphCtx.moveTo(0, h/2); graphCtx.lineTo(w, h/2);
+    graphCtx.stroke();
+    graphCtx.setLineDash([]);
+
+    // Per-device RTT lines
+    Object.keys(deviceHistory).forEach((name, idx) => {
+        const data = deviceHistory[name];
+        const color = COLORS[idx % COLORS.length];
+        const step = w / (HISTORY_LEN - 1);
+
+        graphCtx.beginPath();
+        graphCtx.strokeStyle = color;
+        graphCtx.lineWidth = 1.5;
+        let started = false;
+
+        for (let i = 0; i < data.length; i++) {
+            if (data[i] === null) { started = false; continue; }
+            // Map RTT µs → y:  0µs = center (h/2),  3000µs = top
+            const y = h/2 - (data[i] / 3000) * (h/2 - 8);
+            const x = i * step;
+            if (!started) { graphCtx.moveTo(x, y); started = true; }
+            else graphCtx.lineTo(x, y);
+        }
+        graphCtx.stroke();
+
+        // Last point dot
+        const last = data.filter(v => v !== null).pop();
+        if (last !== undefined) {
+            const x = (data.length - 1) * step;
+            const y = h/2 - (last / 3000) * (h/2 - 8);
+            graphCtx.beginPath();
+            graphCtx.fillStyle = color;
+            graphCtx.arc(x, y, 3, 0, Math.PI * 2);
+            graphCtx.fill();
+        }
+    });
+}
+
+setInterval(drawGraph, 200);
+
+// ─── Live timing poll (every 1 s) ────────────────────────────────────────────
+function updateLiveTiming() {
+    fetch('/api/sendspin/status')
+        .then(r => r.json())
+        .then(clients => {
+            lastClients = clients;
+            const container = document.getElementById('timingRooms');
+            const readout   = document.getElementById('timingReadout');
+            const syncStatus = document.getElementById('sendspin-demo-sync-status');
+            if (!container) return;
+
+            container.innerHTML = '';
+
+            let maxRttMs = 0;
+            clients.forEach((c, idx) => {
+                const rttMs  = c.last_rtt_us / 1000;
+                const synced = c.sync_count >= 3;
+                if (rttMs > maxRttMs) maxRttMs = rttMs;
+
+                pushHistory(c.name, c.last_rtt_us);
+
+                // Sync badge color
+                const badgeColor = synced ? '#10b981' : '#f59e0b';
+                const badgeText  = synced ? `#${c.sync_count}` : `syncing…`;
+
+                // Buffer fill %
+                const bufPct = c.buffer_capacity_kb > 0
+                    ? Math.min(100, Math.round((c.bytes_in_flight_kb / c.buffer_capacity_kb) * 100))
+                    : 0;
+                const bufColor = bufPct > 85 ? '#ef4444' : bufPct > 50 ? '#f59e0b' : '#10b981';
+
+                const deviceColor = COLORS[idx % COLORS.length];
+
+                container.innerHTML += `
+                <div class="room-row">
+                  <div style="width:10px;height:10px;border-radius:50%;background:${deviceColor};flex-shrink:0;margin-right:10px"></div>
+                  <div class="room-row__name">${c.name}</div>
+                  <div style="font-size:0.75rem;color:${badgeColor};background:rgba(0,0,0,0.3);padding:2px 7px;border-radius:20px;margin:0 10px;white-space:nowrap">${badgeText}</div>
+                  <div style="font-size:0.75rem;color:#94a3b8;margin-right:10px;white-space:nowrap">buf ${bufPct}%</div>
+                  <div style="font-size:0.75rem;color:#94a3b8;margin-right:10px;white-space:nowrap">${c.send_ahead_ms}ms ahead</div>
+                  <div class="room-row__meta">${rttMs.toFixed(2)}ms</div>
+                </div>`;
+            });
+
+            if (clients.length === 0) {
+                container.innerHTML = '<div style="color:#64748b;text-align:center;padding:16px;font-size:0.9rem">No Sendspin devices connected</div>';
+            }
+
+            const worstMs = maxRttMs.toFixed(2);
+            readout.innerText   = `${worstMs}ms RTT · ${clients.length} device${clients.length !== 1 ? 's' : ''}`;
+            if (syncStatus) syncStatus.innerText = `worst RTT ${worstMs}ms`;
+        })
+        .catch(() => {
+            const container = document.getElementById('timingRooms');
+            if (container) container.innerHTML = '<div style="color:#ef4444;text-align:center;padding:16px;font-size:0.9rem">⚠ Server unreachable</div>';
+        });
+}
+
+setInterval(updateLiveTiming, 1000);
+setTimeout(updateLiveTiming, 300);
 </script>
 {% endblock %}
+

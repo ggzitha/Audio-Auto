@@ -54,6 +54,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from sqlalchemy.exc import OperationalError
 from . import models, database, mqtt_handler
+from .sendspin_server import sendspin_manager
 
 
 # ─── Filename Sanitisation ────────────────────────────────────────────────────
@@ -483,8 +484,8 @@ def get_devices(db: Session = Depends(database.get_db), user=Depends(require_aut
                 # Older than 3 days, permanently delete
                 db.delete(d)
                 continue
-            elif diff.total_seconds() > 1 * 3600:
-                # Older than 1 hours, mark as offline
+            elif diff.total_seconds() > 60:
+                # Older than 60 seconds, mark as offline
                 d.status = "offline"
                 
         result.append({
@@ -736,7 +737,7 @@ def delete_schedule(schedule_id: int, db: Session = Depends(database.get_db), us
     raise HTTPException(status_code=404, detail="Not found")
 
 @app.post("/api/play")
-def realtime_play(
+async def realtime_play(
     device_name: str = Form("all"),
     audio_id: int = Form(...),
     volume: int = Form(50),
@@ -772,10 +773,14 @@ def realtime_play(
 
     broadcast_state()
     mqtt_handler.publish_command(device_name, cmd)
+    
+    file_path = os.path.join("audio_files", audio.filename)
+    await sendspin_manager.start_playback(file_path, position, bitrate_kbps)
+    
     return {"message": "Play command sent", "start_time": start_time}
 
 @app.post("/api/stop")
-def realtime_stop(device_name: str = Form("all"), clear: bool = Form(False), user=Depends(require_auth)):
+async def realtime_stop(device_name: str = Form("all"), clear: bool = Form(False), user=Depends(require_auth)):
     cmd = {"action": "stop"}
 
     global global_state
@@ -790,10 +795,13 @@ def realtime_stop(device_name: str = Form("all"), clear: bool = Form(False), use
 
     broadcast_state()
     mqtt_handler.publish_command(device_name, cmd)
+    
+    await sendspin_manager.stop_playback()
+    
     return {"message": "Stop command sent"}
 
 @app.post("/api/seek")
-def realtime_seek(
+async def realtime_seek(
     device_name: str = Form("all"), 
     position: float = Form(...),
     audio_id: int = Form(None),
@@ -822,6 +830,11 @@ def realtime_seek(
 
     broadcast_state()
     mqtt_handler.publish_command(device_name, cmd)
+    
+    if audio_id and 'audio' in locals() and audio:
+        file_path = os.path.join("audio_files", audio.filename)
+        await sendspin_manager.seek_playback(file_path, position, cmd.get("bitrate_kbps", 128))
+        
     return {"message": "Seek command sent"}
 
 @app.post("/api/speed")
@@ -851,6 +864,10 @@ def realtime_volume(device_name: str = Form("all"), volume: int = Form(50), user
     broadcast_state()
     mqtt_handler.publish_command(device_name, cmd)
     return {"status": "ok"}
+
+@app.websocket("/sendspin")
+async def sendspin_endpoint(websocket: WebSocket):
+    await sendspin_manager.handle_connection(websocket)
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -898,3 +915,7 @@ async def update_config(request: Request, db: Session = Depends(database.get_db)
 def sync_time(db: Session = Depends(database.get_db), user=Depends(require_auth)):
     mqtt_handler.publish_command("all", {"action": "sync_time"})
     return {"status": "ok"}
+
+@app.get("/api/sendspin/status")
+def sendspin_status(user=Depends(require_auth)):
+    return sendspin_manager.get_client_status()

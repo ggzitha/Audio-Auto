@@ -19,6 +19,7 @@ def on_connect(client, userdata, flags, rc):
     client.subscribe("audioauto/telemetry/#")
     client.subscribe("audioauto/log/#")
     client.subscribe("audioauto/sync_request/#")
+    client.subscribe("audioauto/register")
 
 def on_message(client, userdata, msg):
     try:
@@ -38,7 +39,6 @@ def on_message(client, userdata, msg):
             if len(parts) >= 3:
                 device_name = parts[2]
                 from .main import global_state, get_current_position
-                from .database import SessionLocal
                 from .models import AudioFile
                 import time
                 
@@ -66,9 +66,26 @@ def on_message(client, userdata, msg):
 
         payload = json.loads(msg.payload.decode())
         
+        if topic == "audioauto/register":
+            device_name = payload.get("name")
+            if device_name:
+                db = SessionLocal()
+                device = db.query(Device).filter(Device.name == device_name).first()
+                if not device:
+                    device = Device(name=device_name)
+                    db.add(device)
+                
+                device.ip_address = payload.get("ip", device.ip_address)
+                device.status = "online"
+                device.last_seen = datetime.utcnow()
+                
+                db.commit()
+                db.close()
+            return
+            
         # Topic format: audioauto/telemetry/{device_name}
         parts = topic.split("/")
-        if len(parts) == 3:
+        if len(parts) == 3 and parts[0] == "audioauto" and parts[1] == "telemetry":
             device_name = parts[2]
             
             db = SessionLocal()
