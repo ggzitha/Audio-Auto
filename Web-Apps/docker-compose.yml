@@ -27,6 +27,7 @@ services:
     restart: always
     ports:
       - "9876:8000"
+      - "8927:8927"
     environment:
       - DB_USER=audioauto
       - DB_PASS=secure_db_password

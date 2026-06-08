@@ -73,14 +73,25 @@
 </style>
 
 <div class="max-w-6xl mx-auto space-y-5" id="scheduler-view">
-    <div class="flex items-center justify-between">
+    <div class="flex flex-col sm:flex-row items-center justify-between gap-4">
         <h2 class="text-2xl font-bold text-gray-900 dark:text-white">
             <i class="fas fa-calendar-alt text-primary mr-2"></i>Scheduler
         </h2>
-        <button onclick="window.openScheduleModal(null,null)"
-                class="bg-primary hover:bg-blue-600 text-white px-5 py-2 rounded-xl font-semibold flex items-center gap-2 transition-colors shadow-lg shadow-blue-500/20">
-            <i class="fas fa-plus"></i> Add Schedule
-        </button>
+        <div class="flex items-center space-x-3 w-full sm:w-auto">
+            <div class="flex items-center bg-white dark:bg-[#1e293b] rounded-xl px-3 py-2 shadow-sm border border-gray-200 dark:border-gray-700">
+                <i class="fas fa-file-audio text-gray-500 dark:text-gray-400 text-sm mr-2"></i>
+                <select id="codecSelect" onchange="updateGlobalCodec()" class="bg-transparent border-none text-sm text-gray-700 dark:text-gray-300 outline-none cursor-pointer focus:ring-0">
+                    <option value="pcm">Raw PCM (LAN)</option>
+                    <option value="mp3">MP3 (Compressed)</option>
+                    <option value="flac">FLAC (Lossless)</option>
+                    <option value="opus">OPUS (Voice)</option>
+                </select>
+            </div>
+            <button onclick="window.openScheduleModal(null,null)"
+                    class="bg-primary hover:bg-blue-600 text-white px-5 py-2 rounded-xl font-semibold flex items-center gap-2 transition-colors shadow-lg shadow-blue-500/20 whitespace-nowrap">
+                <i class="fas fa-plus"></i> Add
+            </button>
+        </div>
     </div>
 
     <!-- Calendar -->
@@ -156,11 +167,13 @@
 
                 <!-- Target Device -->
                 <div>
-                    <label class="block text-xs text-gray-500 dark:text-gray-400 mb-1">Target Device</label>
-                    <select id="targetDeviceSelect"
-                        class="w-full bg-gray-100 dark:bg-[#131b2e] border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 text-gray-900 dark:text-white outline-none focus:border-primary">
-                        <option value="all">All Devices</option>
-                    </select>
+                    <label class="block text-xs text-gray-500 dark:text-gray-400 mb-2">Target Device</label>
+                    <div id="targetDeviceContainer" class="space-y-2 max-h-32 overflow-y-auto bg-gray-100 dark:bg-[#131b2e] border border-gray-300 dark:border-gray-600 rounded-lg p-3">
+                        <label class="flex items-center space-x-3 cursor-pointer p-1 hover:bg-gray-200 dark:hover:bg-gray-800 rounded">
+                            <input type="radio" name="targetDevice" value="all" class="text-primary focus:ring-primary h-4 w-4 cursor-pointer" checked>
+                            <span class="text-sm text-gray-900 dark:text-gray-200 font-medium">All Devices</span>
+                        </label>
+                    </div>
                 </div>
 
                 <!-- Audio File -->

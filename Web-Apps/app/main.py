@@ -40,7 +40,7 @@ def _tz_offset_str() -> str:
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Request, Response, status, WebSocket, WebSocketDisconnect
 import json
 import asyncio
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, FileResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
@@ -402,6 +402,7 @@ async def startup_event():
             )
 
     mqtt_handler.on_log_callback = handle_mqtt_log
+    await sendspin_manager.init_server()
     mqtt_handler.start_mqtt()
     scheduler.start()
 
@@ -464,6 +465,10 @@ def get_global_state():
     return state_dict
 
 # --- API Routes ---
+@app.get("/api/sendspin/clients")
+def get_sendspin_clients():
+    return JSONResponse(sendspin_manager.get_client_status())
+
 @app.get("/api/devices")
 def get_devices(db: Session = Depends(database.get_db), user=Depends(require_auth)):
     devices = db.query(models.Device).all()
@@ -736,6 +741,24 @@ def delete_schedule(schedule_id: int, db: Session = Depends(database.get_db), us
         return {"message": "Deleted"}
     raise HTTPException(status_code=404, detail="Not found")
 
+@app.get("/api/settings")
+def get_settings():
+    return {
+        "codec": sendspin_manager.global_codec
+    }
+
+class SettingsRequest(BaseModel):
+    codec: str
+
+@app.post("/api/settings")
+def update_settings(req: SettingsRequest):
+    valid_codecs = ["pcm", "mp3", "flac", "opus"]
+    if req.codec not in valid_codecs:
+        raise HTTPException(status_code=400, detail=f"Invalid codec, must be one of {valid_codecs}")
+    
+    sendspin_manager.global_codec = req.codec
+    return {"status": "ok", "codec": req.codec}
+
 @app.post("/api/play")
 async def realtime_play(
     device_name: str = Form("all"),
@@ -865,9 +888,7 @@ def realtime_volume(device_name: str = Form("all"), volume: int = Form(50), user
     mqtt_handler.publish_command(device_name, cmd)
     return {"status": "ok"}
 
-@app.websocket("/sendspin")
-async def sendspin_endpoint(websocket: WebSocket):
-    await sendspin_manager.handle_connection(websocket)
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -918,4 +939,8 @@ def sync_time(db: Session = Depends(database.get_db), user=Depends(require_auth)
 
 @app.get("/api/sendspin/status")
 def sendspin_status(user=Depends(require_auth)):
+    return sendspin_manager.get_client_status()
+
+@app.get("/api/sendspin/clients")
+def sendspin_clients(user=Depends(require_auth)):
     return sendspin_manager.get_client_status()

@@ -1,12 +1,15 @@
 /**
- * Audio-Auto Client — ESP32-S3 N16R8  v5.0  (Sendspin Protocol)
+ * Audio-Auto Client — ESP32-S3 N16R8  v6.0  (Sendspin Protocol)
  * ═══════════════════════════════════════════════════════════════
  *
- * Same Sendspin protocol as the C6 sketch, optimised for S3 N16R8:
- *   • 256 KB ring buffer in PSRAM (8 MB available on N16R8) — ~1.45 s
- *   • 300 ms lead time / 300 ms min buffer — very stable for LAN
- *   • 240 MHz CPU (set in Arduino IDE: Tools → CPU Frequency → 240 MHz)
- *   • I2S_NUM_0 on GPIO 4 / 5 / 6  (same as Seeed XIAO S3, safe pins)
+ * Major rewrite from v5.0:
+ *   • Dual-core FreeRTOS architecture — no more boot loops
+ *     - Core 0: WiFi, WebSocket, MQTT, time sync (protocol task)
+ *     - Core 1: Audio decode + I2S output (audio task)
+ *   • memcpy-based ring buffer — 10x faster than byte-by-byte
+ *   • Multi-codec: PCM, MP3 (minimp3), FLAC (dr_flac)
+ *   • PSRAM queue for WebSocket→Audio handoff (zero WDT risk)
+ *   • Proper watchdog management throughout
  *
  * ── REQUIREMENTS ─────────────────────────────────────────────────────────────
  *  Board package : Arduino ESP32 v3.x  (ESP-IDF v5)
@@ -51,6 +54,10 @@
 #include "driver/i2s_std.h"     // ESP-IDF v5 I2S API
 #include "esp_timer.h"           // monotonic µs clock
 #include "esp_heap_caps.h"       // MALLOC_CAP_SPIRAM for PSRAM alloc
+#include "esp_task_wdt.h"        // Task watchdog management
+
+#include "minimp3.h"
+#include "dr_flac.h"
 
 using namespace websockets;
 
@@ -71,15 +78,15 @@ const char* MQTT_USER   = "inskal";
 const char* MQTT_PASS   = "admin_inskal_mqtt";
 
 const char* SS_HOST = "192.168.88.8";
-const int   SS_PORT = 9876;
+const int   SS_PORT = 8927;
 const char* SS_PATH = "/sendspin";
 
 // ═════════════════════════════════════════════════════════════════════════════
 // ▶  AUDIO TUNING
 // ═════════════════════════════════════════════════════════════════════════════
 
-// 256 KB in PSRAM ≈ 1.45 s at 176 400 bytes/s — very comfortable buffer
-static const size_t RING_BUF_SIZE         = 256 * 1024;
+// 2 MB in PSRAM ≈ 11.6 s at 176 400 bytes/s — massive buffer for N16R8!
+static const size_t RING_BUF_SIZE         = 2048 * 1024;
 static const int    REQUIRED_LEAD_TIME_MS = 300;
 static const int    MIN_BUFFER_MS         = 300;
 
@@ -93,6 +100,17 @@ static const int PCM_BYTES_FRAME   = 4;
 static const int PCM_BYTES_PER_SEC = 176400;
 
 static const int INITIAL_VOLUME = 80;
+
+// ── Audio chunk queue (WebSocket → Audio task) ───────────────────────────────
+// Each queue item holds a chunk of raw codec data from the WebSocket binary msg
+struct AudioChunk {
+    uint8_t* data;       // PSRAM-allocated
+    size_t   len;
+    int64_t  serverTs;   // Sendspin server timestamp from header
+};
+
+static const int AUDIO_QUEUE_SIZE = 128; // Max chunks in flight
+static QueueHandle_t audioQueue = nullptr;
 
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -119,7 +137,7 @@ public:
     }
 
     int64_t toLocalTime(int64_t serverTs) const {
-        if (!synced) return serverTs;
+        if (count == 0) return serverTs;
         double effDrift = _useDrift ? _drift : 0.0;
         return (int64_t)round(
             ((double)serverTs - _offset + effDrift*(double)_lastUpd) / (1.0+effDrift));
@@ -158,7 +176,7 @@ private:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PCM Ring Buffer  — PSRAM-backed for S3
+// PCM Ring Buffer  — PSRAM-backed, memcpy-optimized for S3
 // ─────────────────────────────────────────────────────────────────────────────
 class PCMRingBuffer {
 public:
@@ -183,17 +201,38 @@ public:
     size_t capacity()  const { return _size; }
 
     bool write(const uint8_t* data, size_t len) {
-        if (!_buf || _avail+len > _size) return false;
-        for (size_t i=0; i<len; i++) { _buf[_tail++]=data[i]; if(_tail>=_size)_tail=0; }
-        _avail+=len; return true;
+        if (!_buf || _avail + len > _size) return false;
+        // memcpy with wrap-around handling
+        size_t firstChunk = _size - _tail;
+        if (len <= firstChunk) {
+            memcpy(_buf + _tail, data, len);
+        } else {
+            memcpy(_buf + _tail, data, firstChunk);
+            memcpy(_buf, data + firstChunk, len - firstChunk);
+        }
+        _tail = (_tail + len) % _size;
+        _avail += len;
+        return true;
     }
+
     size_t read(uint8_t* out, size_t len) {
-        size_t n=(_avail<len)?_avail:len;
-        for (size_t i=0; i<n; i++) { out[i]=_buf[_head++]; if(_head>=_size)_head=0; }
-        _avail-=n; return n;
+        size_t n = (_avail < len) ? _avail : len;
+        if (n == 0) return 0;
+        // memcpy with wrap-around handling
+        size_t firstChunk = _size - _head;
+        if (n <= firstChunk) {
+            memcpy(out, _buf + _head, n);
+        } else {
+            memcpy(out, _buf + _head, firstChunk);
+            memcpy(out + firstChunk, _buf, n - firstChunk);
+        }
+        _head = (_head + n) % _size;
+        _avail -= n;
+        return n;
     }
+
     size_t available() const { return _avail; }
-    void   clear()           { _head=_tail=_avail=0; }
+    void   clear()           { _head = _tail = _avail = 0; }
 
 private:
     uint8_t* _buf;
@@ -201,7 +240,7 @@ private:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Global state (identical structure to C6 sketch)
+// Global state
 // ─────────────────────────────────────────────────────────────────────────────
 WiFiMulti        wifiMulti;
 WiFiClient       netClient;
@@ -215,10 +254,25 @@ i2s_chan_handle_t i2sTxChan = nullptr;
 bool i2sReady = false;
 
 enum class AudioState : uint8_t { IDLE, BUFFERING, PLAYING };
-AudioState audioState = AudioState::IDLE;
+volatile AudioState audioState = AudioState::IDLE;
 
-int64_t firstChunkLocalTs = 0;
-int64_t i2sStartTs        = 0;
+volatile int64_t firstChunkLocalTs = 0;
+volatile int64_t i2sStartTs        = 0;
+
+// Current codec — set by stream/start message
+String currentCodec = "pcm";
+
+// MP3 decoder state — allocated in PSRAM
+mp3dec_t mp3d;
+uint8_t* mp3Remainder = nullptr;       // PSRAM buffer
+size_t   mp3RemainderLen = 0;
+static const size_t MP3_REMAINDER_SIZE = 4096;
+
+// FLAC decoder state
+drflac*  flacDecoder = nullptr;
+uint8_t* flacAccumBuf = nullptr;        // PSRAM accumulation buffer for FLAC frames
+size_t   flacAccumLen = 0;
+static const size_t FLAC_ACCUM_SIZE = 32768;  // 32KB for FLAC frame accumulation
 
 int  currentVolume = INITIAL_VOLUME;
 bool currentMuted  = false;
@@ -229,10 +283,16 @@ unsigned long lastTelemetryMs = 0;
 unsigned long lastWifiCheckMs = 0;
 unsigned long lastMqttLoopMs  = 0;
 unsigned long lastWsRetryMs   = 0;
+int timeBurstCount = 0;
 
-static uint8_t i2sScratch[DMA_BUF_LEN];
+// I2S scratch buffer — PSRAM
+static uint8_t* i2sScratch = nullptr;
+static const size_t I2S_SCRATCH_SIZE = DMA_BUF_LEN;
 
 struct { String action; int volume; bool pending; } pendingMqtt = {"", 0, false};
+
+// FreeRTOS task handle for audio core
+TaskHandle_t audioTaskHandle = nullptr;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -286,16 +346,15 @@ void setupI2S() {
 }
 
 void feedI2S() {
-    if (!i2sReady || !ringBuf) return;
+    if (!i2sReady || !ringBuf || !i2sScratch) return;
     size_t avail = ringBuf->available();
     size_t toWrite;
     if (avail == 0) {
-        memset(i2sScratch, 0, sizeof(i2sScratch));
-        toWrite = sizeof(i2sScratch);
-        Serial.println("WARN: I2S underrun");
+        memset(i2sScratch, 0, I2S_SCRATCH_SIZE);
+        toWrite = I2S_SCRATCH_SIZE;
     } else {
-        toWrite = min(avail, sizeof(i2sScratch));
-        toWrite &= ~3u;
+        toWrite = min(avail, I2S_SCRATCH_SIZE);
+        toWrite &= ~3u;  // Align to 4 bytes (stereo 16-bit frame)
         if (toWrite == 0) return;
         ringBuf->read(i2sScratch, toWrite);
         applyVolume(i2sScratch, toWrite);
@@ -308,8 +367,29 @@ void feedI2S() {
 // Sendspin stream control
 // ─────────────────────────────────────────────────────────────────────────────
 void stopStream() {
-    audioState=AudioState::IDLE; firstChunkLocalTs=0; i2sStartTs=0;
-    if(ringBuf) ringBuf->clear();
+    audioState = AudioState::IDLE;
+    firstChunkLocalTs = 0;
+    i2sStartTs = 0;
+    if (ringBuf) ringBuf->clear();
+    
+    // Drain the audio queue
+    if (audioQueue) {
+        AudioChunk chunk;
+        while (xQueueReceive(audioQueue, &chunk, 0) == pdTRUE) {
+            if (chunk.data) heap_caps_free(chunk.data);
+        }
+    }
+    
+    // Reset FLAC decoder
+    if (flacDecoder) {
+        drflac_close(flacDecoder);
+        flacDecoder = nullptr;
+    }
+    flacAccumLen = 0;
+    
+    // Reset MP3 remainder
+    mp3RemainderLen = 0;
+    
     Serial.println("[Sendspin] Stream stopped");
 }
 
@@ -317,57 +397,79 @@ void stopStream() {
 // Sendspin outgoing messages
 // ─────────────────────────────────────────────────────────────────────────────
 void sendClientHello() {
-    StaticJsonDocument<512> doc;
+    DynamicJsonDocument doc(2048);
     doc["type"]      = "client/hello";
-    doc["client_id"] = DEVICE_NAME;
-    doc["name"]      = DEVICE_NAME;
-    doc["version"]   = 1;
-    JsonArray roles = doc.createNestedArray("supported_roles");
+    JsonObject payload = doc.createNestedObject("payload");
+    payload["client_id"] = DEVICE_NAME;
+    payload["name"]      = DEVICE_NAME;
+    payload["version"]   = 1;
+    JsonArray roles = payload.createNestedArray("supported_roles");
     roles.add("player@v1"); roles.add("controller@v1");
-    JsonObject ps = doc.createNestedObject("player@v1_support");
+    JsonObject ps = payload.createNestedObject("player@v1_support");
     JsonArray fmts = ps.createNestedArray("supported_formats");
-    JsonObject f = fmts.createNestedObject();
-    f["codec"]="pcm"; f["sample_rate"]=PCM_SAMPLE_RATE; f["channels"]=2; f["bit_depth"]=16;
+    
+    // Advertise ALL supported codecs
+    // 1. Raw PCM
+    JsonObject fPcm = fmts.createNestedObject();
+    fPcm["codec"]="pcm"; fPcm["sample_rate"]=PCM_SAMPLE_RATE; fPcm["channels"]=2; fPcm["bit_depth"]=16;
+    
+    // 2. MP3
+    JsonObject fMp3 = fmts.createNestedObject();
+    fMp3["codec"]="mp3"; fMp3["sample_rate"]=PCM_SAMPLE_RATE; fMp3["channels"]=2; fMp3["bit_depth"]=16;
+    
+    // 3. FLAC
+    JsonObject fFlac = fmts.createNestedObject();
+    fFlac["codec"]="flac"; fFlac["sample_rate"]=PCM_SAMPLE_RATE; fFlac["channels"]=2; fFlac["bit_depth"]=16;
+    
     ps["buffer_capacity"] = (int)(ringBuf ? ringBuf->capacity() * 4 / 5 : RING_BUF_SIZE * 4 / 5);
     JsonArray cmds = ps.createNestedArray("supported_commands");
     cmds.add("volume"); cmds.add("mute");
-    char buf[512]; serializeJson(doc, buf);
-    wsClient.send(buf);
-    Serial.println("[Sendspin] → client/hello");
+    String out; serializeJson(doc, out);
+    wsClient.send(out);
+    Serial.println("[Sendspin] → client/hello (pcm+mp3+flac)");
 }
 
 void sendClientState() {
-    StaticJsonDocument<256> doc;
-    doc["type"]="client/state"; doc["state"]="synchronized";
-    JsonObject p = doc.createNestedObject("player");
+    DynamicJsonDocument doc(512);
+    doc["type"]="client/state"; 
+    JsonObject payload = doc.createNestedObject("payload");
+    payload["state"]="synchronized";
+    JsonObject p = payload.createNestedObject("player");
     p["volume"]=currentVolume; p["muted"]=currentMuted;
     p["static_delay_ms"]=0;
     p["required_lead_time_ms"]=REQUIRED_LEAD_TIME_MS;
     p["min_buffer_ms"]=MIN_BUFFER_MS;
-    char buf[256]; serializeJson(doc, buf);
-    wsClient.send(buf);
+    String out; serializeJson(doc, out);
+    wsClient.send(out);
 }
 
 void sendClientTime() {
     int64_t T1 = localUs();
-    StaticJsonDocument<128> doc;
+    DynamicJsonDocument doc(256);
     doc["type"]="client/time";
-    doc["client_transmitted"]=(double)T1;
-    char buf[128]; serializeJson(doc, buf);
-    wsClient.send(buf);
+    JsonObject payload = doc.createNestedObject("payload");
+    payload["client_transmitted"]=(double)T1;
+    String out; serializeJson(doc, out);
+    wsClient.send(out);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Sendspin incoming message handlers
 // ─────────────────────────────────────────────────────────────────────────────
 void handleServerHello(JsonDocument& doc) {
-    Serial.printf("[Sendspin] ← server/hello  id=%s\n", (const char*)(doc["server_id"]|"?"));
-    sendClientState(); sendClientTime(); lastTimeSendMs = millis();
+    JsonObject payload = doc["payload"];
+    const char* sid = payload["server_id"] | "?";
+    Serial.printf("[Sendspin] ← server/hello  id=%s\n", sid);
+    timeBurstCount = 0;
+    sendClientState(); 
+    sendClientTime(); 
+    lastTimeSendMs = millis();
 }
 
 void handleServerTime(JsonDocument& doc) {
     int64_t T4 = localUs();
-    double T1d=doc["client_transmitted"]|0.0, T2d=doc["server_received"]|0.0, T3d=doc["server_transmitted"]|0.0;
+    JsonObject payload = doc["payload"];
+    double T1d=payload["client_transmitted"]|0.0, T2d=payload["server_received"]|0.0, T3d=payload["server_transmitted"]|0.0;
     timeFilter.update((int64_t)T1d,(int64_t)T2d,(int64_t)T3d,T4);
     if (timeFilter.count <= 6) {
         int64_t rtt = (T4-(int64_t)T1d)-((int64_t)T3d-(int64_t)T2d);
@@ -377,29 +479,53 @@ void handleServerTime(JsonDocument& doc) {
 }
 
 void handleStreamStart(JsonDocument& doc) {
-    const char* codec = doc["player"]["codec"]|"?";
+    JsonObject payload = doc["payload"];
+    const char* codec = payload["player"]["codec"]|"?";
+    currentCodec = String(codec);
     Serial.printf("[Sendspin] ← stream/start  codec=%s\n", codec);
     stopStream();
     if (!i2sReady) setupI2S();
     audioState = AudioState::BUFFERING;
-    Serial.printf("[Sendspin] Buffering... (buf=%d KB)\n", (int)(ringBuf->capacity()/1024));
+    
+    // Initialize codec-specific state
+    if (currentCodec == "mp3") {
+        mp3dec_init(&mp3d);
+        mp3RemainderLen = 0;
+    } else if (currentCodec == "flac") {
+        flacAccumLen = 0;
+        // FLAC decoder will be initialized on first data
+    }
+    
+    Serial.printf("[Sendspin] Buffering... (buf=%d KB, codec=%s)\n",
+        (int)(ringBuf->capacity()/1024), codec);
 }
 
 void handleStreamEnd()  { Serial.println("[Sendspin] ← stream/end");   stopStream(); }
 void handleStreamClear() {
     Serial.println("[Sendspin] ← stream/clear");
-    if(ringBuf)ringBuf->clear(); firstChunkLocalTs=0; i2sStartTs=0;
+    if(ringBuf)ringBuf->clear();
+    firstChunkLocalTs=0; i2sStartTs=0;
+    
+    // Drain queue
+    if (audioQueue) {
+        AudioChunk chunk;
+        while (xQueueReceive(audioQueue, &chunk, 0) == pdTRUE) {
+            if (chunk.data) heap_caps_free(chunk.data);
+        }
+    }
+    
     audioState=AudioState::BUFFERING;
 }
 
 void handleServerCommand(JsonDocument& doc) {
-    JsonObject p = doc["player"]; if(p.isNull())return;
+    JsonObject payload = doc["payload"];
+    JsonObject p = payload["player"]; if(p.isNull())return;
     if(p.containsKey("volume")) { currentVolume=constrain((int)p["volume"],0,100); sendClientState(); }
     if(p.containsKey("mute"))   { currentMuted=(bool)p["mute"]; sendClientState(); }
 }
 
 void handleJsonMessage(const String& text) {
-    StaticJsonDocument<512> doc;
+    DynamicJsonDocument doc(2048);
     if (deserializeJson(doc, text) != DeserializationError::Ok) return;
     const char* type = doc["type"]|"";
     if      (!strcmp(type,"server/hello"))   handleServerHello(doc);
@@ -410,23 +536,218 @@ void handleJsonMessage(const String& text) {
     else if (!strcmp(type,"server/command")) handleServerCommand(doc);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// WebSocket binary handler — FAST path, just enqueue to PSRAM
+// No decoding here! Decoding happens in the Audio Task on Core 1.
+// ─────────────────────────────────────────────────────────────────────────────
 void handleBinaryMessage(const uint8_t* data, size_t len) {
     static const int HDR = 9;
     if (len < (size_t)(HDR+1) || data[0] != 4) return;
-    int64_t serverTs=0;
-    for(int i=0;i<8;i++) serverTs=(serverTs<<8)|(int64_t)data[1+i];
-    const uint8_t* pcm = data+HDR;
-    size_t pcmLen = len-HDR;
-    if (audioState==AudioState::IDLE) return;
-    if (firstChunkLocalTs==0) {
-        firstChunkLocalTs = timeFilter.synced ? timeFilter.toLocalTime(serverTs) : serverTs;
+    
+    // Parse Sendspin header: 1 byte type + 8 bytes timestamp
+    int64_t serverTs = 0;
+    for (int i = 0; i < 8; i++) serverTs = (serverTs << 8) | (int64_t)data[1+i];
+    
+    if (audioState == AudioState::IDLE) return;
+    
+    // Set timing on first chunk
+    if (firstChunkLocalTs == 0) {
+        firstChunkLocalTs = timeFilter.toLocalTime(serverTs);
         i2sStartTs = firstChunkLocalTs - DMA_LATENCY_US;
-        Serial.printf("[Sync] First chunk: play in %.1f ms (sync=%d)\n",
-            (float)(firstChunkLocalTs-localUs())/1000.0f, timeFilter.count);
+        Serial.printf("[Sync] First chunk: play in %.1f ms (sync count=%d)\n",
+            (float)(firstChunkLocalTs - localUs()) / 1000.0f, timeFilter.count);
     }
-    if (!ringBuf->write(pcm, pcmLen)) {
-        static unsigned long w=0;
-        if(millis()-w>2000){w=millis(); Serial.println("WARN: Ring buffer full");}
+    
+    // Copy payload to PSRAM and enqueue for audio task
+    size_t payloadLen = len - HDR;
+    uint8_t* chunkData = (uint8_t*)heap_caps_malloc(payloadLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!chunkData) {
+        // Fallback to internal RAM
+        chunkData = (uint8_t*)malloc(payloadLen);
+        if (!chunkData) {
+            static unsigned long w = 0;
+            if (millis() - w > 2000) { w = millis(); Serial.println("WARN: Failed to alloc chunk"); }
+            return;
+        }
+    }
+    memcpy(chunkData, data + HDR, payloadLen);
+    
+    AudioChunk chunk = { chunkData, payloadLen, serverTs };
+    if (xQueueSend(audioQueue, &chunk, 0) != pdTRUE) {
+        // Queue full — drop chunk
+        heap_caps_free(chunkData);
+        static unsigned long w = 0;
+        if (millis() - w > 2000) { w = millis(); Serial.println("WARN: Audio queue full, dropping chunk"); }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audio Decode Functions — called from Audio Task (Core 1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+void decodePCM(const uint8_t* data, size_t len) {
+    if (!ringBuf->write(data, len)) {
+        static unsigned long w = 0;
+        if (millis() - w > 2000) { w = millis(); Serial.println("WARN: Ring buffer full (PCM)"); }
+    }
+}
+
+void decodeMP3(const uint8_t* data, size_t len) {
+    // Combine remainder with new data
+    // Use a PSRAM-allocated decode buffer to avoid stack overflow
+    static uint8_t* decodeBuf = nullptr;
+    static const size_t DECODE_BUF_SIZE = 8192;
+    if (!decodeBuf) {
+        decodeBuf = (uint8_t*)heap_caps_malloc(DECODE_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!decodeBuf) decodeBuf = (uint8_t*)malloc(DECODE_BUF_SIZE);
+    }
+    if (!decodeBuf) return;
+    
+    const uint8_t* inBuf;
+    size_t inLen;
+    
+    if (mp3RemainderLen > 0 && mp3Remainder) {
+        size_t copyLen = min(len, DECODE_BUF_SIZE - mp3RemainderLen);
+        memcpy(decodeBuf, mp3Remainder, mp3RemainderLen);
+        memcpy(decodeBuf + mp3RemainderLen, data, copyLen);
+        inBuf = decodeBuf;
+        inLen = mp3RemainderLen + copyLen;
+    } else {
+        inBuf = data;
+        inLen = len;
+    }
+    
+    // PSRAM-allocated PCM output buffer (avoids stack overflow)
+    static short* pcm_frame = nullptr;
+    if (!pcm_frame) {
+        pcm_frame = (short*)heap_caps_malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(short),
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!pcm_frame) pcm_frame = (short*)malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(short));
+    }
+    if (!pcm_frame) return;
+    
+    mp3dec_frame_info_t info;
+    size_t offset = 0;
+    int framesDecoded = 0;
+    
+    while (offset < inLen) {
+        int samples = mp3dec_decode_frame(&mp3d, inBuf + offset, inLen - offset, pcm_frame, &info);
+        if (info.frame_bytes > 0) {
+            if (samples > 0) {
+                ringBuf->write((uint8_t*)pcm_frame, samples * info.channels * 2);
+            }
+            offset += info.frame_bytes;
+            framesDecoded++;
+            // Yield every 4 frames to prevent WDT
+            if (framesDecoded % 4 == 0) vTaskDelay(1);
+        } else {
+            break;
+        }
+    }
+    
+    // Save remainder
+    mp3RemainderLen = inLen - offset;
+    if (mp3RemainderLen > 0 && mp3RemainderLen <= MP3_REMAINDER_SIZE && mp3Remainder) {
+        if (inBuf == decodeBuf) {
+            memmove(mp3Remainder, inBuf + offset, mp3RemainderLen);
+        } else {
+            memcpy(mp3Remainder, data + (len - mp3RemainderLen), mp3RemainderLen);
+        }
+    } else {
+        mp3RemainderLen = 0;
+    }
+}
+
+void decodeFLAC(const uint8_t* data, size_t len) {
+    if (!flacAccumBuf) return;
+    
+    // Accumulate incoming FLAC data
+    size_t copyLen = min(len, FLAC_ACCUM_SIZE - flacAccumLen);
+    memcpy(flacAccumBuf + flacAccumLen, data, copyLen);
+    flacAccumLen += copyLen;
+    
+    // Try to decode from accumulated buffer using dr_flac memory decoder
+    // dr_flac_open_memory works on complete FLAC streams, but we can use it
+    // for frame-by-frame decode by accumulating enough data
+    drflac* dec = drflac_open_memory(flacAccumBuf, flacAccumLen, NULL);
+    if (dec) {
+        // Successfully parsed FLAC header — decode all available frames
+        static int16_t* flacPcm = nullptr;
+        static const size_t FLAC_PCM_SAMPLES = 4096; // samples per channel
+        if (!flacPcm) {
+            flacPcm = (int16_t*)heap_caps_malloc(FLAC_PCM_SAMPLES * 2 * sizeof(int16_t),
+                                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!flacPcm) flacPcm = (int16_t*)malloc(FLAC_PCM_SAMPLES * 2 * sizeof(int16_t));
+        }
+        if (flacPcm) {
+            drflac_uint64 framesRead;
+            do {
+                framesRead = drflac_read_pcm_frames_s16(dec, FLAC_PCM_SAMPLES, flacPcm);
+                if (framesRead > 0) {
+                    size_t bytesDecoded = (size_t)(framesRead * dec->channels * sizeof(int16_t));
+                    ringBuf->write((uint8_t*)flacPcm, bytesDecoded);
+                }
+                vTaskDelay(1); // Yield
+            } while (framesRead == FLAC_PCM_SAMPLES);
+        }
+        drflac_close(dec);
+        // Data consumed — reset accumulator
+        flacAccumLen = 0;
+    }
+    // If we couldn't parse yet, data stays in accumulator for next chunk
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audio Task — runs on Core 1, handles decode + I2S output
+// ─────────────────────────────────────────────────────────────────────────────
+void audioTask(void* param) {
+    Serial.println("[AudioTask] Started on Core 1");
+    
+    // Subscribe this task to the watchdog
+    esp_task_wdt_add(NULL);
+    
+    AudioChunk chunk;
+    
+    for (;;) {
+        esp_task_wdt_reset();
+        
+        // 1. Process any queued audio chunks (decode → ring buffer)
+        int chunksProcessed = 0;
+        while (chunksProcessed < 8 && xQueueReceive(audioQueue, &chunk, 0) == pdTRUE) {
+            if (chunk.data && chunk.len > 0) {
+                if (currentCodec == "pcm") {
+                    decodePCM(chunk.data, chunk.len);
+                } else if (currentCodec == "mp3") {
+                    decodeMP3(chunk.data, chunk.len);
+                } else if (currentCodec == "flac") {
+                    decodeFLAC(chunk.data, chunk.len);
+                }
+                // else: unknown codec, silently skip
+            }
+            if (chunk.data) heap_caps_free(chunk.data);
+            chunksProcessed++;
+        }
+        
+        // 2. Audio state machine
+        if (audioState == AudioState::BUFFERING && firstChunkLocalTs > 0) {
+            if (localUs() >= i2sStartTs) {
+                audioState = AudioState::PLAYING;
+                Serial.println("[Sync] Playback started");
+            }
+        }
+        
+        // 3. Feed I2S if playing
+        if (audioState == AudioState::PLAYING) {
+            feedI2S();
+        }
+        
+        // Small yield to prevent starving other tasks
+        // Use 1ms delay when idle, tight polling when playing
+        if (audioState == AudioState::PLAYING && ringBuf && ringBuf->available() > 0) {
+            taskYIELD();
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
     }
 }
 
@@ -450,7 +771,6 @@ void connectWS() {
     lastWsRetryMs=millis();
     Serial.printf("[WS] Connecting %s:%d%s …\n", SS_HOST, SS_PORT, SS_PATH);
     wsClient.onMessage(onWsMessage); wsClient.onEvent(onWsEvent);
-    wsClient.setMaxMessageSize(8192);
     wsClient.connect(SS_HOST, SS_PORT, SS_PATH);
 }
 
@@ -460,7 +780,7 @@ void connectWS() {
 void mqttCallback(char* topic, byte* payload, unsigned int len) {
     String msg; msg.reserve(len);
     for (unsigned int i=0;i<len;i++) msg+=(char)payload[i];
-    StaticJsonDocument<256> doc;
+    DynamicJsonDocument doc(512);
     if(deserializeJson(doc,msg)!=DeserializationError::Ok) return;
     const char* a=doc["action"]|"";
     if(!strcmp(a,"volume")) pendingMqtt={"volume",constrain((int)(doc["volume"]|currentVolume),0,100),true};
@@ -482,15 +802,17 @@ void connectMQTT() {
     }
 }
 void publishTelemetry() {
-    StaticJsonDocument<256> doc;
+    DynamicJsonDocument doc(512);
     doc["ip"]=WiFi.localIP().toString(); doc["rssi"]=WiFi.RSSI();
     doc["ws_connected"]=wsConnected; doc["sync_count"]=timeFilter.count;
     doc["sync_offset_ms"]=(float)timeFilter.offsetMs();
     doc["audio_state"]=(audioState==AudioState::PLAYING)?"playing":
                        (audioState==AudioState::BUFFERING)?"buffering":"idle";
+    doc["codec"]=currentCodec;
+    doc["free_psram_kb"]=(int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)/1024);
     if(ringBuf) { doc["buf_kb"]=(int)(ringBuf->available()/1024); doc["buf_cap_kb"]=(int)(ringBuf->capacity()/1024); }
-    char buf[256]; serializeJson(doc,buf);
-    mqtt.publish(("audioauto/telemetry/"+String(DEVICE_NAME)).c_str(),buf);
+    String out; serializeJson(doc, out);
+    mqtt.publish(("audioauto/telemetry/"+String(DEVICE_NAME)).c_str(), out.c_str());
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -498,10 +820,13 @@ void setup() {
     Serial.begin(115200);
     delay(300);
     Serial.println("\n╔═══════════════════════════════════╗");
-    Serial.println("║  Audio-Auto ESP32-S3 N16R8 v5.0  ║");
-    Serial.println("║  Sendspin Protocol / PCM Direct  ║");
+    Serial.println("║  Audio-Auto ESP32-S3 N16R8 v6.0  ║");
+    Serial.println("║  Sendspin / PCM+MP3+FLAC / Dual  ║");
     Serial.println("╚═══════════════════════════════════╝");
     Serial.println(DEVICE_NAME);
+    Serial.printf("[Heap] Free internal: %d KB, Free PSRAM: %d KB\n",
+        (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)/1024),
+        (int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)/1024));
 
     // ── Allocate ring buffer (PSRAM) ─────────────────────────────────────────
     ringBuf = new PCMRingBuffer(RING_BUF_SIZE);
@@ -509,6 +834,29 @@ void setup() {
         Serial.println("[FATAL] Ring buffer allocation failed — halting");
         while(true) delay(1000);
     }
+    
+    // ── Allocate I2S scratch buffer (PSRAM) ──────────────────────────────────
+    i2sScratch = (uint8_t*)heap_caps_malloc(I2S_SCRATCH_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!i2sScratch) i2sScratch = (uint8_t*)malloc(I2S_SCRATCH_SIZE);
+    
+    // ── Allocate MP3 remainder buffer (PSRAM) ────────────────────────────────
+    mp3Remainder = (uint8_t*)heap_caps_malloc(MP3_REMAINDER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!mp3Remainder) mp3Remainder = (uint8_t*)malloc(MP3_REMAINDER_SIZE);
+    
+    // ── Allocate FLAC accumulation buffer (PSRAM) ────────────────────────────
+    flacAccumBuf = (uint8_t*)heap_caps_malloc(FLAC_ACCUM_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!flacAccumBuf) flacAccumBuf = (uint8_t*)malloc(FLAC_ACCUM_SIZE);
+    
+    // ── Create audio chunk queue ─────────────────────────────────────────────
+    audioQueue = xQueueCreate(AUDIO_QUEUE_SIZE, sizeof(AudioChunk));
+    if (!audioQueue) {
+        Serial.println("[FATAL] Audio queue creation failed — halting");
+        while(true) delay(1000);
+    }
+    Serial.println("[Queue] Audio chunk queue created (128 slots)");
+    
+    // ── Init MP3 decoder ─────────────────────────────────────────────────────
+    mp3dec_init(&mp3d);
 
     // ── WiFi ─────────────────────────────────────────────────────────────────
     wifiMulti.addAP(WIFI_SSID1,WIFI_PASS1);
@@ -528,12 +876,25 @@ void setup() {
     // ── I2S ──────────────────────────────────────────────────────────────────
     setupI2S();
 
+    // ── Start Audio Task on Core 1 ───────────────────────────────────────────
+    xTaskCreatePinnedToCore(
+        audioTask,        // Function
+        "AudioTask",      // Name
+        8192,             // Stack size (bytes)
+        NULL,             // Parameters
+        2,                // Priority (higher than loop)
+        &audioTaskHandle, // Handle
+        1                 // Core 1
+    );
+
     // ── Sendspin WS ──────────────────────────────────────────────────────────
     connectWS();
 
     Serial.println("\n[Ready] Waiting for Sendspin stream…\n");
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// loop() runs on Core 0 — protocol only, NO audio processing
 // ═════════════════════════════════════════════════════════════════════════════
 void loop() {
     // 1. WebSocket
@@ -548,37 +909,35 @@ void loop() {
         } else if (pendingMqtt.action=="stop") stopStream();
     }
 
-    // 3. Audio state machine
-    if (audioState==AudioState::BUFFERING && firstChunkLocalTs>0) {
-        if (localUs()>=i2sStartTs) {
-            audioState=AudioState::PLAYING;
-            Serial.println("[Sync] Playback started");
+    // 3. Clock sync heartbeat
+    if (wsConnected) {
+        unsigned long interval = (timeBurstCount < 20) ? 50UL : 1000UL;
+        if (millis() - lastTimeSendMs >= interval) {
+            lastTimeSendMs = millis();
+            sendClientTime();
+            if (timeBurstCount < 20) timeBurstCount++;
         }
     }
-    if (audioState==AudioState::PLAYING) feedI2S();
 
-    // 4. Clock sync heartbeat
-    if (wsConnected) {
-        unsigned long interval=(timeFilter.count<5)?250UL:1000UL;
-        if (millis()-lastTimeSendMs>=interval) { lastTimeSendMs=millis(); sendClientTime(); }
-    }
-
-    // 5. WiFi watchdog
+    // 4. WiFi watchdog
     if (millis()-lastWifiCheckMs>5000) {
         lastWifiCheckMs=millis();
         if(wifiMulti.run()!=WL_CONNECTED){ wsConnected=false; Serial.println("[WiFi] Reconnecting…"); }
     }
 
-    // 6. MQTT
+    // 5. MQTT
     if (millis()-lastMqttLoopMs>=10) {
         lastMqttLoopMs=millis();
         if(!mqtt.connected())connectMQTT();
         mqtt.loop();
     }
 
-    // 7. Telemetry
+    // 6. Telemetry
     if (millis()-lastTelemetryMs>20000) {
         lastTelemetryMs=millis();
         if(mqtt.connected())publishTelemetry();
     }
+    
+    // 7. Yield to avoid WDT on Core 0
+    vTaskDelay(pdMS_TO_TICKS(1));
 }

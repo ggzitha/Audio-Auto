@@ -328,14 +328,16 @@ void stopStream() {
 // Sendspin outgoing messages
 // ─────────────────────────────────────────────────────────────────────────────
 void sendClientHello() {
-    StaticJsonDocument<512> doc;
-    doc["type"]="client/hello"; doc["client_id"]=DEVICE_NAME;
-    doc["name"]=DEVICE_NAME;    doc["version"]=1;
+    StaticJsonDocument<768> doc;
+    doc["type"]="client/hello"; 
+    JsonObject payload = doc.createNestedObject("payload");
+    payload["client_id"]=DEVICE_NAME;
+    payload["name"]=DEVICE_NAME;    payload["version"]=1;
 
-    JsonArray roles=doc.createNestedArray("supported_roles");
+    JsonArray roles=payload.createNestedArray("supported_roles");
     roles.add("player@v1"); roles.add("controller@v1");
 
-    JsonObject ps=doc.createNestedObject("player@v1_support");
+    JsonObject ps=payload.createNestedObject("player@v1_support");
     JsonArray fmts=ps.createNestedArray("supported_formats");
     JsonObject f=fmts.createNestedObject();
     f["codec"]="pcm"; f["sample_rate"]=PCM_SAMPLE_RATE;
@@ -346,29 +348,32 @@ void sendClientHello() {
     JsonArray cmds=ps.createNestedArray("supported_commands");
     cmds.add("volume"); cmds.add("mute");
 
-    char buf[512]; serializeJson(doc,buf);
+    char buf[768]; serializeJson(doc,buf);
     wsClient.send(buf);
     Serial.println("[Sendspin] → client/hello");
 }
 
 void sendClientState() {
-    StaticJsonDocument<256> doc;
-    doc["type"]="client/state"; doc["state"]="synchronized";
-    JsonObject p=doc.createNestedObject("player");
+    StaticJsonDocument<384> doc;
+    doc["type"]="client/state"; 
+    JsonObject payload = doc.createNestedObject("payload");
+    payload["state"]="synchronized";
+    JsonObject p=payload.createNestedObject("player");
     p["volume"]=currentVolume; p["muted"]=currentMuted;
     p["static_delay_ms"]=0;
     p["required_lead_time_ms"]=REQUIRED_LEAD_TIME_MS;
     p["min_buffer_ms"]=MIN_BUFFER_MS;
-    char buf[256]; serializeJson(doc,buf);
+    char buf[384]; serializeJson(doc,buf);
     wsClient.send(buf);
 }
 
 void sendClientTime() {
     int64_t T1=localUs();
-    StaticJsonDocument<128> doc;
+    StaticJsonDocument<192> doc;
     doc["type"]="client/time";
-    doc["client_transmitted"]=(double)T1;
-    char buf[128]; serializeJson(doc,buf);
+    JsonObject payload = doc.createNestedObject("payload");
+    payload["client_transmitted"]=(double)T1;
+    char buf[192]; serializeJson(doc,buf);
     wsClient.send(buf);
 }
 
@@ -376,15 +381,17 @@ void sendClientTime() {
 // Sendspin incoming message handlers
 // ─────────────────────────────────────────────────────────────────────────────
 void handleServerHello(JsonDocument& doc) {
-    Serial.printf("[Sendspin] ← server/hello  id=%s\n",(const char*)(doc["server_id"]|"?"));
+    JsonObject payload = doc["payload"];
+    Serial.printf("[Sendspin] ← server/hello  id=%s\n",(const char*)(payload["server_id"]|"?"));
     sendClientState(); sendClientTime(); lastTimeSendMs=millis();
 }
 
 void handleServerTime(JsonDocument& doc) {
     int64_t T4=localUs();
-    double T1d=doc["client_transmitted"]|0.0;
-    double T2d=doc["server_received"]    |0.0;
-    double T3d=doc["server_transmitted"] |0.0;
+    JsonObject payload = doc["payload"];
+    double T1d=payload["client_transmitted"]|0.0;
+    double T2d=payload["server_received"]    |0.0;
+    double T3d=payload["server_transmitted"] |0.0;
     timeFilter.update((int64_t)T1d,(int64_t)T2d,(int64_t)T3d,T4);
     if (timeFilter.count<=6) {
         int64_t rtt=(T4-(int64_t)T1d)-((int64_t)T3d-(int64_t)T2d);
@@ -394,7 +401,8 @@ void handleServerTime(JsonDocument& doc) {
 }
 
 void handleStreamStart(JsonDocument& doc) {
-    const char* codec=doc["player"]["codec"]|"?";
+    JsonObject payload = doc["payload"];
+    const char* codec=payload["player"]["codec"]|"?";
     Serial.printf("[Sendspin] ← stream/start  codec=%s\n",codec);
     stopStream();
     if (!i2sReady) setupI2S();
@@ -415,7 +423,8 @@ void handleStreamClear() {
 }
 
 void handleServerCommand(JsonDocument& doc) {
-    JsonObject p=doc["player"]; if(p.isNull())return;
+    JsonObject payload = doc["payload"];
+    JsonObject p=payload["player"]; if(p.isNull())return;
     if(p.containsKey("volume")) {
         currentVolume=constrain((int)p["volume"],0,100);
         Serial.printf("[Sendspin] Volume → %d\n",currentVolume);
@@ -429,7 +438,7 @@ void handleServerCommand(JsonDocument& doc) {
 }
 
 void handleJsonMessage(const String& text) {
-    StaticJsonDocument<512> doc;
+    StaticJsonDocument<1024> doc;
     if (deserializeJson(doc,text)!=DeserializationError::Ok) return;
     const char* type=doc["type"]|"";
     if      (!strcmp(type,"server/hello"))   handleServerHello(doc);

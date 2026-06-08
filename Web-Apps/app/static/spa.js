@@ -4,9 +4,75 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const mainContent = document.getElementById('spa-content');
     const bottomPlayer = document.getElementById('bottom-player');
-    // Single shared audio element - persists across SPA navigation
-    const localAudio = document.getElementById('localAudio');
+    // ─── Native SendspinPlayer Integration ────────────────────────────────────
+    let storedPlayerId = localStorage.getItem('sendspin_player_id');
+    if (!storedPlayerId) {
+        storedPlayerId = 'webapp-' + Math.random().toString(36).substr(2, 9);
+        localStorage.setItem('sendspin_player_id', storedPlayerId);
+    }
 
+    window.sendspinPlayer = new SendspinJS.SendspinPlayer({
+        playerId: storedPlayerId,
+        clientName: 'Web App',
+        baseUrl: `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.hostname}:8927`,
+        onStateChange: (state) => {
+            // Update UI based on native state if needed
+            // However, we still rely on /api/state for the broader playlist context
+        }
+    });
+
+    window.sendspinPlayer.connect().catch(e => console.error('Sendspin connect error:', e));
+
+    const resumeAudioCtx = () => {
+        const ctx = window.sendspinPlayer?.scheduler?.audioContext;
+        if (ctx && ctx.state === 'suspended') {
+            ctx.resume().then(() => {
+                console.log('[Audio] AudioContext resumed via user interaction');
+                hideAudioJoinOverlay();
+            });
+        }
+    };
+
+    // Resume on ANY user interaction — covers late joiners
+    ['click', 'touchstart', 'keydown', 'pointerdown'].forEach(evt => {
+        document.addEventListener(evt, resumeAudioCtx, { passive: true });
+    });
+
+    // ─── Audio Join Overlay Logic ─────────────────────────────────────────────
+    const audioJoinOverlay = document.getElementById('audioJoinOverlay');
+    const audioJoinBtn = document.getElementById('audioJoinBtn');
+    let overlayShown = false;
+
+    function showAudioJoinOverlay() {
+        if (audioJoinOverlay && !overlayShown) {
+            audioJoinOverlay.classList.remove('hidden');
+            overlayShown = true;
+        }
+    }
+
+    function hideAudioJoinOverlay() {
+        if (audioJoinOverlay) {
+            audioJoinOverlay.classList.add('hidden');
+            overlayShown = false;
+        }
+    }
+
+    if (audioJoinBtn) {
+        audioJoinBtn.addEventListener('click', () => {
+            resumeAudioCtx();
+            hideAudioJoinOverlay();
+        });
+    }
+
+    // Periodically check if AudioContext is suspended while playback is active
+    setInterval(() => {
+        const ctx = window.sendspinPlayer?.scheduler?.audioContext;
+        if (ctx && ctx.state === 'suspended' && window.globalState?.is_playing) {
+            showAudioJoinOverlay();
+        } else if (ctx && ctx.state === 'running') {
+            hideAudioJoinOverlay();
+        }
+    }, 500);
     // ─── Global Playback State ────────────────────────────────────────────────
     window.globalState = {
         audio_id: null,
@@ -25,14 +91,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.allFiles = [];
     window.playTimeoutId = null;
 
-    if (localAudio && !window.localAudioEndedListenerAttached) {
-        localAudio.addEventListener('ended', () => {
-            if (!wavesurferInitialized && window.globalState.is_playing) {
-                stopPlayback();
-            }
-        });
-        window.localAudioEndedListenerAttached = true;
-    }
+    // localAudio removed, handled by SendspinPlayer
 
     // ─── WaveSurfer (singleton, lives forever) ────────────────────────────────
     let wavesurfer = null;
@@ -166,67 +225,8 @@ document.addEventListener('DOMContentLoaded', () => {
         };
     }
 
-    // ─── Autoplay Unlock (Browser Policy) ────────────────────────────────────
-    // Browsers require a user gesture before playing audio. If the server is
-    // already playing when this client connects (new tab/phone), we show a
-    // toast asking the user to tap, then seek to the correct position.
-    let autoplayBlocked = false;
-
-    function showAutoplaySyncToast() {
-        // Remove any existing toast
-        const existing = document.getElementById('autoplayToast');
-        if (existing) existing.remove();
-
-        const toast = document.createElement('div');
-        toast.id = 'autoplayToast';
-        toast.style.cssText = [
-            'position:fixed', 'bottom:100px', 'left:50%', 'transform:translateX(-50%)',
-            'background:linear-gradient(135deg,#3b82f6,#6366f1)',
-            'color:#fff', 'padding:14px 28px', 'border-radius:40px',
-            'font-weight:600', 'font-size:15px', 'cursor:pointer',
-            'z-index:9999', 'box-shadow:0 8px 32px rgba(99,102,241,0.5)',
-            'display:flex', 'align-items:center', 'gap:10px',
-            'animation:slideUp 0.3s ease'
-        ].join(';');
-        toast.innerHTML = '<i class="fas fa-play-circle"></i> Tap to join playback';
-
-        toast.addEventListener('click', () => {
-            autoplayBlocked = false;
-            toast.remove();
-            // Now seek to current position and play
-            const state = window.globalState;
-            if (state.audio_id && localAudio && localAudio.src) {
-                let pos = state.current_position || state.position || 0;
-                // Account for time elapsed since state was received
-                if (state.is_playing && state.server_time > 0) {
-                    const clientNow = Date.now() / 1000;
-                    pos = state.position + (clientNow - state.last_updated) * (state.speed || 1.0);
-                    pos = Math.max(0, pos);
-                }
-                localAudio.currentTime = pos;
-                localAudio.play().then(() => {
-                    if (wavesurfer) {
-                        const dur = wavesurfer.getDuration ? wavesurfer.getDuration() : 0;
-                        if (dur > 0) wavesurfer.seekTo(Math.min(1, pos / dur));
-                        wavesurfer.play().catch(() => {});
-                    }
-                }).catch(e => console.error('Play after tap:', e));
-            }
-        });
-
-        document.body.appendChild(toast);
-    }
-
     // ─── State Sync Logic ─────────────────────────────────────────────────────
-    /**
-     * Core synchronization function.
-     * The server sends `position` (at time `last_updated`) and `server_time` (now).
-     * We compute: actualPosition = position + (server_time - last_updated) * speed
-     * Then we seek the audio to that position and play/pause accordingly.
-     */
     function applyServerState(state) {
-        const prevAudioId = window.globalState.audio_id;
-
         window.globalState = { ...window.globalState, ...state };
 
         // Compute actual current playback position
@@ -245,102 +245,20 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         window.globalState.current_position = actualPosition;
 
-        // Load new audio file if track changed AND not already loading it.
-        // currentLoadedAudioId is set by selectSong() before this arrives,
-        // so we skip the redundant second load that caused the double-load race.
+        // Load new audio file into wavesurfer (visual only)
         const fileObj = window.allFiles.find(f => f.id === state.audio_id);
         if (fileObj && state.audio_id !== currentLoadedAudioId) {
-            if (localAudio) {
-                localAudio.src = `/audio_files/${encodeURIComponent(fileObj.filename)}`;
-                currentLoadedAudioId = state.audio_id;
-                // wavesurfer.load() internally manages localAudio.src and load()
-                if (wavesurfer) {
-                    wavesurfer.load(localAudio.src).catch(e => {
-                        if (e.name !== 'AbortError') console.error(e);
-                    });
-                } else {
-                    localAudio.load();
-                }
+            currentLoadedAudioId = state.audio_id;
+            if (wavesurfer) {
+                wavesurfer.load(`/audio_files/${encodeURIComponent(fileObj.filename)}`).catch(e => {
+                    if (e.name !== 'AbortError') console.error(e);
+                });
             }
         }
 
         // Sync volume
-        if (localAudio && state.volume !== undefined) {
-            localAudio.volume = state.volume / 100.0;
-        }
-
-        // Play/Pause with autoplay unlock handling
-        if (state.is_playing && state.audio_id) {
-            if (localAudio && localAudio.src && !localAudio.src.endsWith(window.location.host + '/')) {
-
-                const tryPlay = () => {
-                    const doPlay = () => {
-                        if (wavesurfer && wavesurfer.getDuration && wavesurfer.getDuration() > 0) {
-                            const duration = wavesurfer.getDuration();
-                            if (Math.abs(wavesurfer.getCurrentTime() - actualPosition) > 2.0) {
-                                wavesurfer.seekTo(Math.min(1, Math.max(0, actualPosition / duration)));
-                            }
-                            wavesurfer.play().catch(err => {
-                                if (err.name === 'NotAllowedError') { autoplayBlocked = true; showAutoplaySyncToast(); }
-                            });
-                        } else {
-                            if (Math.abs(localAudio.currentTime - actualPosition) > 2.0) {
-                                localAudio.currentTime = actualPosition;
-                            }
-                            localAudio.play().catch(err => {
-                                if (err.name === 'NotAllowedError') { autoplayBlocked = true; showAutoplaySyncToast(); }
-                            });
-                        }
-                    };
-
-                    if (delayMs > 0) {
-                        if (localAudio && !localAudio.paused) localAudio.pause();
-                        if (wavesurfer) wavesurfer.pause();
-                        
-                        if (wavesurfer && wavesurfer.getDuration && wavesurfer.getDuration() > 0) {
-                            wavesurfer.seekTo(Math.min(1, Math.max(0, actualPosition / wavesurfer.getDuration())));
-                        } else if (localAudio) {
-                            localAudio.currentTime = actualPosition;
-                        }
-
-                        if (window.playTimeoutId) { clearTimeout(window.playTimeoutId); }
-                        window.playTimeoutId = setTimeout(() => {
-                            window.playTimeoutId = null;
-                            if (window.globalState.is_playing) doPlay();
-                        }, delayMs);
-                    } else {
-                        if (window.playTimeoutId) { clearTimeout(window.playTimeoutId); window.playTimeoutId = null; }
-                        
-                        if (localAudio && !localAudio.paused) {
-                            const currentPos = wavesurfer && wavesurfer.getDuration && wavesurfer.getDuration() > 0 ? wavesurfer.getCurrentTime() : localAudio.currentTime;
-                            if (Math.abs(currentPos - actualPosition) > 3.0) {
-                                if (wavesurfer && wavesurfer.getDuration && wavesurfer.getDuration() > 0) {
-                                    wavesurfer.seekTo(Math.min(1, Math.max(0, actualPosition / wavesurfer.getDuration())));
-                                } else if (localAudio) {
-                                    localAudio.currentTime = actualPosition;
-                                }
-                            }
-                        } else {
-                            doPlay();
-                        }
-                    }
-                };
-
-                if (localAudio.readyState < 2) {
-                    localAudio.addEventListener('canplay', tryPlay, { once: true });
-                } else {
-                    tryPlay();
-                }
-
-            }
-        } else if (!state.is_playing) {
-            if (window.playTimeoutId) { clearTimeout(window.playTimeoutId); window.playTimeoutId = null; }
-            if (localAudio && !localAudio.paused) localAudio.pause();
-            if (wavesurfer) wavesurfer.pause();
-            // Remove autoplay toast when stopped
-            const toast = document.getElementById('autoplayToast');
-            if (toast) toast.remove();
-            autoplayBlocked = false;
+        if (state.volume !== undefined && window.sendspinPlayer) {
+            window.sendspinPlayer.setVolume(state.volume);
         }
 
         updateUIFromState();
@@ -409,11 +327,112 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    // ─── API Commands ─────────────────────────────────────────────────────────
+    // ─── API Commands & Modal Logic ───────────────────────────────────────────
+    let selectedDevices = new Set(['all']);
+
     function getTargetDevice() {
-        const deviceSelect = document.getElementById('deviceSelect');
-        return deviceSelect ? deviceSelect.value : 'all';
+        if (selectedDevices.has('all')) return 'all';
+        return Array.from(selectedDevices).join(',');
     }
+
+    window.openDeviceModal = function() {
+        const modal = document.getElementById('deviceModal');
+        const content = document.getElementById('deviceModalContent');
+        if (modal && content) {
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+            setTimeout(() => {
+                content.classList.remove('scale-95', 'opacity-0');
+                content.classList.add('scale-100', 'opacity-100');
+            }, 10);
+        }
+        window.renderDeviceModalList();
+    };
+
+    window.closeDeviceModal = function() {
+        const modal = document.getElementById('deviceModal');
+        const content = document.getElementById('deviceModalContent');
+        if (modal && content) {
+            content.classList.remove('scale-100', 'opacity-100');
+            content.classList.add('scale-95', 'opacity-0');
+            setTimeout(() => {
+                modal.classList.add('hidden');
+                modal.classList.remove('flex');
+            }, 300);
+        }
+    };
+
+    window.selectAllDevices = function() {
+        selectedDevices.clear();
+        selectedDevices.add('all');
+        window.renderDeviceModalList();
+    };
+
+    window.deselectAllDevices = function() {
+        selectedDevices.clear();
+        window.renderDeviceModalList();
+    };
+
+    window.toggleDeviceSelection = function(devName) {
+        if (selectedDevices.has('all')) {
+            selectedDevices.clear();
+        }
+        if (selectedDevices.has(devName)) {
+            selectedDevices.delete(devName);
+        } else {
+            selectedDevices.add(devName);
+        }
+        if (selectedDevices.size === 0) {
+            selectedDevices.add('all');
+        }
+        window.renderDeviceModalList();
+    };
+
+    window.applyDeviceSelection = function() {
+        const text = document.getElementById('selectedDeviceText');
+        if (text) {
+            if (selectedDevices.has('all')) {
+                text.innerText = 'All Devices';
+            } else {
+                const arr = Array.from(selectedDevices);
+                if (arr.length === 1) text.innerText = arr[0];
+                else text.innerText = arr.length + ' Devices Selected';
+            }
+        }
+        window.closeDeviceModal();
+    };
+
+    window.renderDeviceModalList = function() {
+        const list = document.getElementById('deviceModalList');
+        if (!list) return;
+        fetch('/api/devices').then(r => r.json()).then(devices => {
+            devices = devices.filter(d => d.name !== 'Web App');
+            if (devices.length === 0) {
+                list.innerHTML = '<div class="text-center text-sm text-gray-500 py-4">No devices found.</div>';
+                return;
+            }
+            list.innerHTML = devices.map(d => {
+                const isSelected = selectedDevices.has('all') || selectedDevices.has(d.name);
+                const isOnline = d.status === 'online';
+                return `
+                    <div onclick="window.toggleDeviceSelection('${d.name}')" class="flex items-center justify-between p-3 rounded-lg border ${isSelected ? 'border-primary bg-blue-50 dark:bg-blue-900/20' : 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800'} cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
+                        <div class="flex items-center space-x-3">
+                            <div class="w-8 h-8 rounded-full ${isOnline ? 'bg-green-100 text-green-600 dark:bg-green-900/30 dark:text-green-400' : 'bg-red-100 text-red-600 dark:bg-red-900/30 dark:text-red-400'} flex items-center justify-center">
+                                <i class="fas fa-speaker"></i>
+                            </div>
+                            <div>
+                                <h4 class="font-semibold text-gray-800 dark:text-gray-200">${d.name}</h4>
+                                <p class="text-xs text-gray-500">${isOnline ? 'Online' : 'Offline'} • ${d.ip_address || 'N/A'}</p>
+                            </div>
+                        </div>
+                        <div class="text-primary">
+                            <i class="fas ${isSelected ? 'fa-check-circle text-lg' : 'fa-circle text-gray-300 dark:text-gray-600'}"></i>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        });
+    };
 
     function pushStateChange(action, payload) {
         const formData = new FormData();
@@ -433,17 +452,11 @@ document.addEventListener('DOMContentLoaded', () => {
         currentLoadedAudioId = id;
 
         const audioSrc = `/audio_files/${encodeURIComponent(fileObj.filename)}`;
-        if (localAudio) {
-            localAudio.src = audioSrc;
-            // Let wavesurfer.load() drive the loading if available;
-            // it internally calls load() on the media element.
-            if (wavesurfer) {
-                wavesurfer.load(audioSrc).catch(e => {
-                    if (e.name !== 'AbortError') console.error(e);
-                });
-            } else {
-                localAudio.load();
-            }
+        // Let wavesurfer.load() drive the loading if available;
+        if (wavesurfer) {
+            wavesurfer.load(audioSrc).catch(e => {
+                if (e.name !== 'AbortError') console.error(e);
+            });
         }
 
         // Tell server to broadcast play command (ESP32 + other web clients)
@@ -502,22 +515,50 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // ─── WaveSurfer Initialization ────────────────────────────────────────────
+
     function initWaveSurfer() {
         const container = document.getElementById('waveformContainer');
         if (!container) return;
+
+        // UI Update interval based on server state extrapolation
+        if (!window.sendspinPlayerUIInterval) {
+            window.sendspinPlayerUIInterval = setInterval(() => {
+                if (window.globalState && window.globalState.is_playing) {
+                    const elapsed = (Date.now() / 1000) - window.globalState.last_updated;
+                    let currentTime = window.globalState.position + (elapsed * (window.globalState.speed || 1.0));
+                    
+                    const dur = wavesurfer ? wavesurfer.getDuration() : 0;
+                    if (dur > 0 && currentTime > dur) currentTime = dur;
+
+                    // update wavesurfer UI visually without triggering its audio
+                    if (wavesurfer && dur > 0) {
+                        wavesurfer.seekTo(currentTime / dur);
+                    }
+
+                    const t = formatTime(currentTime);
+                    const timeElapsed = document.getElementById('timeElapsed');
+                    if (timeElapsed && timeElapsed.innerText !== t) timeElapsed.innerText = t;
+                    if (miniTimeElapsed && miniTimeElapsed.innerText !== t) miniTimeElapsed.innerText = t;
+
+                    if (dur > 0) {
+                        const pct = (currentTime / dur) * 100;
+                        if (miniProgressOverlay) miniProgressOverlay.style.width = pct + '%';
+                        const progressBar = document.getElementById('progressBar');
+                        if (progressBar) progressBar.style.width = pct + '%';
+                    }
+                }
+            }, 100);
+        }
 
         if (typeof WaveSurfer === 'undefined') {
             console.error("WaveSurfer not loaded!");
             return;
         }
 
-        // Move the persistent container into the current DOM slot
         container.innerHTML = '';
         container.appendChild(globalWaveformContainer);
 
-        // Only create WaveSurfer once
         if (wavesurferInitialized) {
-            // Re-attach events to the refreshed dashboard DOM
             _attachDashboardWaveSurferEvents();
             return;
         }
@@ -532,14 +573,27 @@ document.addEventListener('DOMContentLoaded', () => {
             barRadius: 2,
             height: 64,
             normalize: true,
-            media: localAudio  // link to the persistent audio element
+            interact: true
         });
 
-        // If audio is already loaded (e.g. user navigated away and back)
-        if (localAudio && localAudio.src && !localAudio.src.endsWith(window.location.host + '/')) {
-            wavesurfer.load(localAudio.src).catch(e => {
-                if (e.name !== 'AbortError') console.error(e);
-            });
+        wavesurfer.on('interaction', () => {
+            if (window.globalState && window.globalState.audio_id) {
+                const newTime = wavesurfer.getCurrentTime();
+                pushStateChange('play', {
+                    audio_id: window.globalState.audio_id,
+                    volume: window.globalState.volume,
+                    position: newTime
+                });
+            }
+        });
+
+        if (window.globalState.audio_id) {
+            const fileObj = window.allFiles.find(f => f.id === window.globalState.audio_id);
+            if (fileObj) {
+                wavesurfer.load(`/audio_files/${encodeURIComponent(fileObj.filename)}`).catch(e => {
+                    if (e.name !== 'AbortError') console.error(e);
+                });
+            }
         }
 
         wavesurfer.on('ready', () => {
@@ -548,7 +602,6 @@ document.addEventListener('DOMContentLoaded', () => {
             if (timeTotal) timeTotal.innerText = formatTime(dur);
             if (miniTimeTotal) miniTimeTotal.innerText = formatTime(dur);
 
-            // Update duration in the playlist if it was 0
             if (window.globalState.audio_id) {
                 const fileObj = window.allFiles.find(f => f.id === window.globalState.audio_id);
                 if (fileObj && (!fileObj.duration_sec || fileObj.duration_sec === 0)) {
@@ -557,64 +610,23 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (el) el.innerText = formatTime(dur);
                 }
             }
-
-            // Seek to synced position when waveform loads
-            const syncPos = window.globalState.current_position || window.globalState.position;
-            if (syncPos > 0 && dur > 0) {
-                wavesurfer.seekTo(Math.min(1, syncPos / dur));
-            }
-            if (window.globalState.is_playing) {
-                wavesurfer.play().catch(() => {});
-            }
         });
 
-        wavesurfer.on('audioprocess', (currentTime) => {
-            const t = formatTime(currentTime);
-            const timeElapsed = document.getElementById('timeElapsed');
-            if (timeElapsed) timeElapsed.innerText = t;
-            if (miniTimeElapsed) miniTimeElapsed.innerText = t;
-
-            const dur = wavesurfer.getDuration();
-            const pct = dur > 0 ? (currentTime / dur) * 100 : 0;
-            if (miniProgressOverlay) miniProgressOverlay.style.width = pct + '%';
-        });
-
-        wavesurfer.on('finish', stopPlayback);
 
         _attachDashboardWaveSurferEvents();
     }
 
     function _attachDashboardWaveSurferEvents() {
-        // Re-bind seek interaction each time dashboard loads
         if (!wavesurfer) return;
-        wavesurfer.un('interaction');
-        wavesurfer.on('interaction', (newPosition) => {
-            if (!window.globalState.audio_id) return;
-            if (window.globalState.is_playing) {
-                pushStateChange('seek', { 
-                    position: newPosition,
-                    audio_id: window.globalState.audio_id
-                });
-            } else {
-                pushStateChange('play', {
-                    audio_id: window.globalState.audio_id,
-                    volume: window.globalState.volume,
-                    position: newPosition
-                });
-            }
-        });
-
-        // If audio is already loaded, update UI immediately
+        // Since interact is false, the user can't click to seek on the waveform directly.
+        // If we want to allow seeking, we'd enable interact and handle the 'interaction' event.
+        // For now, seeking is handled by pushing state manually.
+        
         if (wavesurfer.getDuration && wavesurfer.getDuration() > 0) {
             const dur = wavesurfer.getDuration();
             const timeTotal = document.getElementById('timeTotal');
             if (timeTotal) timeTotal.innerText = formatTime(dur);
             if (miniTimeTotal) miniTimeTotal.innerText = formatTime(dur);
-            
-            const timeElapsed = document.getElementById('timeElapsed');
-            const currentT = wavesurfer.getCurrentTime();
-            if (timeElapsed) timeElapsed.innerText = formatTime(currentT);
-            if (miniTimeElapsed) miniTimeElapsed.innerText = formatTime(currentT);
         }
     }
 
@@ -626,8 +638,107 @@ document.addEventListener('DOMContentLoaded', () => {
         else if (url === '/config') initConfig();
     };
 
+    let syncChart = null;
+    let syncInterval = null;
+
+    function initSyncChart() {
+        const ctx = document.getElementById('sendspin-demo-sync-graph');
+        if (!ctx) return;
+        
+        if (syncChart) syncChart.destroy();
+        
+        syncChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: []
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                animation: { duration: 0 },
+                scales: {
+                    x: { display: false },
+                    y: { 
+                        title: { display: true, text: 'Offset (ms)' },
+                        grid: { color: 'rgba(156, 163, 175, 0.2)' }
+                    }
+                },
+                plugins: {
+                    legend: { position: 'top', labels: { color: '#9ca3af' } }
+                }
+            }
+        });
+    }
+
+    function updateSyncData() {
+        if (window.location.pathname !== '/' && window.location.pathname !== '') return;
+        
+        fetch('/api/sendspin/clients').then(r => r.json()).then(clients => {
+            const viz = document.getElementById('timingVizContainer');
+            if (viz) {
+                if (clients.length === 0) {
+                    viz.innerHTML = '<div class="text-sm text-gray-500 text-center py-4">Waiting for device data...</div>';
+                } else {
+                    viz.innerHTML = clients.map(c => {
+                        const rttMs = (c.last_rtt_us / 1000).toFixed(1);
+                        const offsetMs = (c.sync_offset_us / 1000).toFixed(2);
+                        const syncCount = c.sync_count || 0;
+                        const rttColor = c.last_rtt_us < 5000 ? 'text-green-500' : c.last_rtt_us < 20000 ? 'text-yellow-500' : 'text-red-500';
+                        const offsetColor = Math.abs(c.sync_offset_us) < 1000 ? 'text-green-500' : Math.abs(c.sync_offset_us) < 5000 ? 'text-yellow-500' : 'text-red-500';
+                        return `
+                            <div class="flex justify-between items-center p-2 rounded bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700">
+                                <div class="flex items-center space-x-2">
+                                    <i class="fas fa-microchip text-primary"></i>
+                                    <span class="font-medium">${c.name || c.id}</span>
+                                </div>
+                                <div class="flex space-x-4 text-xs font-mono">
+                                    <span class="${rttColor}" title="Round Trip Time"><i class="fas fa-exchange-alt mr-1"></i>${rttMs}ms RTT</span>
+                                    <span class="${offsetColor}" title="Sync Offset"><i class="fas fa-clock mr-1"></i>${offsetMs}ms offset</span>
+                                    <span class="text-blue-500" title="Sync Count"><i class="fas fa-sync mr-1"></i>${syncCount} syncs</span>
+                                </div>
+                            </div>
+                        `;
+                    }).join('');
+                }
+            }
+
+            if (syncChart) {
+                const now = new Date().toLocaleTimeString();
+                syncChart.data.labels.push(now);
+                if (syncChart.data.labels.length > 30) syncChart.data.labels.shift();
+
+                clients.forEach((c, i) => {
+                    let ds = syncChart.data.datasets.find(d => d.label === (c.name || c.id));
+                    if (!ds) {
+                        const colors = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6'];
+                        ds = {
+                            label: c.name || c.id,
+                            data: Array(syncChart.data.labels.length - 1).fill(null),
+                            borderColor: colors[i % colors.length],
+                            borderWidth: 2,
+                            tension: 0.4,
+                            pointRadius: 2,
+                            pointBackgroundColor: colors[i % colors.length],
+                        };
+                        syncChart.data.datasets.push(ds);
+                    }
+                    // Plot real sync offset in milliseconds
+                    const offsetMs = c.sync_offset_us ? (c.sync_offset_us / 1000) : 0;
+                    ds.data.push(offsetMs);
+                    if (ds.data.length > 30) ds.data.shift();
+                });
+
+                syncChart.update();
+            }
+        }).catch(e => console.error("Sync data error:", e));
+    }
+
     function initDashboard() {
         initWaveSurfer();
+        initSyncChart();
+        if (syncInterval) clearInterval(syncInterval);
+        syncInterval = setInterval(updateSyncData, 1000);
 
         // Bind player controls
         const btnPlay = document.getElementById('btnPlay');
@@ -646,32 +757,38 @@ document.addEventListener('DOMContentLoaded', () => {
         if (volSlider) {
             volSlider.value = window.globalState.volume;
             volSlider.addEventListener('input', e => {
-                if (localAudio) localAudio.volume = e.target.value / 100.0;
+                if (window.sendspinPlayer && typeof window.sendspinPlayer.setVolume === 'function') {
+                    window.sendspinPlayer.setVolume(e.target.value / 100.0);
+                }
             });
             volSlider.addEventListener('change', e => {
                 pushStateChange('volume', { volume: e.target.value });
             });
         }
 
-        const speedSelect = document.getElementById('speedSelect');
-        if (speedSelect) {
-            speedSelect.value = window.globalState.speed.toString();
-            speedSelect.addEventListener('change', e => {
-                pushStateChange('speed', { speed: e.target.value });
-            });
+        
+        const codecSelect = document.getElementById('codecSelect');
+        if (codecSelect) {
+            fetch('/api/settings').then(r => r.json()).then(settings => {
+                codecSelect.value = settings.codec || 'pcm';
+            }).catch(e => console.error("Settings fetch error:", e));
         }
 
-        // Load device list into deviceSelect
-        fetch('/api/devices').then(r => r.json()).then(devices => {
-            const deviceSelect = document.getElementById('deviceSelect');
-            if (deviceSelect) {
-                let html = '<option value="all">All Devices</option>';
-                devices.filter(d => d.name !== 'Web App').forEach(d => {
-                    html += `<option value="${d.name}">${d.name}</option>`;
-                });
-                deviceSelect.innerHTML = html;
-            }
-        });
+        window.updateGlobalCodec = function() {
+            const val = document.getElementById('codecSelect').value;
+            fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ codec: val })
+            }).then(r => r.json()).then(res => {
+                if (res.status === 'ok') {
+                    console.log('Codec updated to', val);
+                }
+            }).catch(e => console.error("Codec update error:", e));
+        };
+
+        // No longer load devices into a <select>
+        // We use Device Modal instead.
 
         // Load file list
         fetch('/api/files').then(r => r.json()).then(files => {
@@ -915,11 +1032,23 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // Populate device select
         fetch('/api/devices').then(r => r.json()).then(devices => {
-            const select = document.getElementById('targetDeviceSelect');
-            if (select) {
-                let html = '<option value="all">All Devices</option>';
-                devices.filter(d => d.name !== 'Web App').forEach(d => { html += `<option value="${d.name}">${d.name}</option>`; });
-                select.innerHTML = html;
+            const container = document.getElementById('targetDeviceContainer');
+            if (container) {
+                let html = `
+                    <label class="flex items-center space-x-3 cursor-pointer p-1 hover:bg-gray-200 dark:hover:bg-gray-800 rounded">
+                        <input type="radio" name="targetDevice" value="all" class="text-primary focus:ring-primary h-4 w-4 cursor-pointer" checked>
+                        <span class="text-sm text-gray-900 dark:text-gray-200 font-medium">All Devices</span>
+                    </label>
+                `;
+                devices.filter(d => d.name !== 'Web App').forEach(d => {
+                    html += `
+                        <label class="flex items-center space-x-3 cursor-pointer p-1 hover:bg-gray-200 dark:hover:bg-gray-800 rounded">
+                            <input type="radio" name="targetDevice" value="${d.name}" class="text-primary focus:ring-primary h-4 w-4 cursor-pointer">
+                            <span class="text-sm text-gray-900 dark:text-gray-200 font-medium">${d.name}</span>
+                        </label>
+                    `;
+                });
+                container.innerHTML = html;
             }
         });
 
@@ -974,7 +1103,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 const payload = {
                     audio_id: parseInt(audioId),
-                    device_name: document.getElementById('targetDeviceSelect')?.value || 'all',
+                    device_name: document.querySelector('input[name="targetDevice"]:checked')?.value || 'all',
                     play_time: localStr,
                     repeat: document.getElementById('repeatSelect')?.value || 'none',
                     volume: parseInt(document.getElementById('scheduleVolumeSelect')?.value || 70)
@@ -1120,7 +1249,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (miniVolSlider) {
         miniVolSlider.addEventListener('input', e => {
-            if (localAudio) localAudio.volume = e.target.value / 100.0;
+            if (window.sendspinPlayer && typeof window.sendspinPlayer.setVolume === 'function') {
+                window.sendspinPlayer.setVolume(e.target.value / 100.0);
+            }
         });
         miniVolSlider.addEventListener('change', e => {
             pushStateChange('volume', { volume: parseInt(e.target.value) });
@@ -1192,7 +1323,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     <i class="fas fa-cloud-upload-alt text-4xl text-primary mb-2"></i>
                     <p class="text-sm text-gray-600 dark:text-gray-400">Drag & drop audio files here<br>or click to browse</p>
                     <p class="text-xs text-gray-500 mt-2">Supported: mp3, wav, flac, aac, ogg</p>
-                    <input type="file" id="swalFileInput" multiple accept=".mp3,.wav,.flac,.aac,.ogg" class="hidden">
+                    <input type="file" id="swalFileInput" multiple class="hidden">
                 </div>
                 <div id="swalUploadStatus" class="hidden">
                     <div class="w-full bg-gray-200 rounded-full h-2.5 dark:bg-gray-700 mb-2">

@@ -12,3 +12,5 @@ pydantic-settings==2.2.1
 passlib
 itsdangerous
 websockets==12.0
+aiosendspin
+sendspin
