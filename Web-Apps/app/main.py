@@ -275,47 +275,46 @@ def require_auth(request: Request, db: Session = Depends(database.get_db)):
     return user
 
 def execute_schedule(schedule_id: int):
+    """Execute a scheduled playback via Sendspin (no MQTT)."""
     db = database.SessionLocal()
     schedule = db.query(models.Schedule).filter(models.Schedule.id == schedule_id).first()
     if schedule and schedule.is_active:
         audio = schedule.audio
         if audio:
-            url = audio_url("192.168.88.8:9876", audio.filename)
-            # Give 5s for all devices to receive and buffer
-            start_time = int(time.time()) + 5
             bitrate_kbps = _calc_bitrate_kbps(audio.filename, audio.duration_sec)
-
-            cmd = {
-                "action": "play",
-                "url": url,
-                "start_time": start_time,
-                "volume": schedule.volume,
-                "position": 0.0,
-                "bitrate_kbps": bitrate_kbps
-            }
-            mqtt_handler.publish_command(schedule.device_name, cmd)
-
-            # Update global state
-            global global_state
-            global_state.audio_id = audio.id
-            global_state.is_playing = True
-            global_state.position = 0.0
-            global_state.volume = schedule.volume
-            global_state.last_updated = float(start_time)  # will start counting from start_time
-
-            if schedule.device_name in ["all", "Web App"]:
-                state_dict = global_state.dict()
-                state_dict["server_time"] = time.time()
-                if main_loop and main_loop.is_running():
-                    asyncio.run_coroutine_threadsafe(
-                        manager.broadcast({"type": "state", "state": state_dict}),
-                        main_loop
-                    )
-
-            if schedule.repeat == "none":
-                schedule.is_active = False
-                db.commit()
+            
+            # Use asyncio to run the async Sendspin playback
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # Create a new future in the running loop
+                    asyncio.ensure_future(_do_schedule_playback(
+                        audio.id, audio.filename, schedule.volume, bitrate_kbps,
+                        schedule.device_name, schedule.repeat
+                    ))
+                else:
+                    loop.run_until_complete(_do_schedule_playback(
+                        audio.id, audio.filename, schedule.volume, bitrate_kbps,
+                        schedule.device_name, schedule.repeat
+                    ))
+            except Exception as e:
+                print(f"[Schedule] Error: {e}")
     db.close()
+
+async def _do_schedule_playback(audio_id: int, filename: str, volume: int, 
+                                  bitrate_kbps: int, device_name: str, repeat: str):
+    """Async helper for scheduled playback."""
+    global global_state
+    global_state.audio_id = audio_id
+    global_state.is_playing = True
+    global_state.position = 0.0
+    global_state.volume = volume
+    global_state.last_updated = time.time()
+    
+    file_path = os.path.join("audio_files", filename)
+    await sendspin_manager.start_playback(file_path, 0.0, bitrate_kbps)
+    
+    broadcast_state()
 
 def add_schedule_job(sch: models.Schedule):
     if sch.repeat == "none":
@@ -761,53 +760,41 @@ def update_settings(req: SettingsRequest):
 
 @app.post("/api/play")
 async def realtime_play(
-    device_name: str = Form("all"),
     audio_id: int = Form(...),
     volume: int = Form(50),
     position: float = Form(0.0),
     db: Session = Depends(database.get_db),
     user=Depends(require_auth)
 ):
+    """
+    Play audio via Sendspin only (no MQTT).
+    All connected clients (ESP32 + Web) receive audio via Sendspin WebSocket.
+    """
     audio = db.query(models.AudioFile).filter(models.AudioFile.id == audio_id).first()
     if not audio:
         raise HTTPException(status_code=404, detail="Audio not found")
 
-    url = audio_url("192.168.88.8:9876", audio.filename)
-    # Give 2 seconds for all listeners to receive the command and buffer
-    start_time = int(time.time()) + 2
     bitrate_kbps = _calc_bitrate_kbps(audio.filename, audio.duration_sec)
-
-    cmd = {
-        "action": "play",
-        "url": url,
-        "start_time": start_time,
-        "volume": volume,
-        "position": position,
-        "bitrate_kbps": bitrate_kbps
-    }
 
     global global_state
     global_state.audio_id = audio_id
     global_state.is_playing = True
     global_state.position = position
     global_state.volume = volume
-    # Set last_updated to start_time so position counting begins correctly
-    global_state.last_updated = float(start_time)
+    global_state.last_updated = time.time()
 
     broadcast_state()
-    mqtt_handler.publish_command(device_name, cmd)
     
+    # Audio ONLY via Sendspin - no MQTT commands
     file_path = os.path.join("audio_files", audio.filename)
     await sendspin_manager.start_playback(file_path, position, bitrate_kbps)
     
-    return {"message": "Play command sent", "start_time": start_time}
+    return {"message": "Play started via Sendspin", "position": position}
 
 @app.post("/api/stop")
-async def realtime_stop(device_name: str = Form("all"), clear: bool = Form(False), user=Depends(require_auth)):
-    cmd = {"action": "stop"}
-
+async def realtime_stop(clear: bool = Form(False), user=Depends(require_auth)):
+    """Stop playback via Sendspin only (no MQTT)."""
     global global_state
-    # Snapshot the current position before pausing
     global_state.position = get_current_position()
     global_state.is_playing = False
     global_state.last_updated = time.time()
@@ -817,75 +804,66 @@ async def realtime_stop(device_name: str = Form("all"), clear: bool = Form(False
         global_state.position = 0.0
 
     broadcast_state()
-    mqtt_handler.publish_command(device_name, cmd)
     
+    # Audio ONLY via Sendspin - no MQTT commands
     await sendspin_manager.stop_playback()
     
-    return {"message": "Stop command sent"}
+    return {"message": "Stop sent via Sendspin"}
 
 @app.post("/api/seek")
 async def realtime_seek(
-    device_name: str = Form("all"), 
     position: float = Form(...),
     audio_id: int = Form(None),
     db: Session = Depends(database.get_db),
     user=Depends(require_auth)
 ):
-    # 300ms sync window: enough for MQTT to reach all ESP32s before they seek,
-    # but imperceptible to the human ear (vs. 1s which is very noticeable).
-    sync_delay = 0.3
-    start_time = time.time() + sync_delay
-    cmd = {
-        "action": "seek",
-        "position": position,
-        "start_time": start_time
-    }
-
+    """Seek playback via Sendspin only (no MQTT)."""
     if audio_id:
         audio = db.query(models.AudioFile).filter(models.AudioFile.id == audio_id).first()
         if audio:
-            cmd["url"] = audio_url("192.168.88.8:9876", audio.filename)
-            cmd["bitrate_kbps"] = _calc_bitrate_kbps(audio.filename, audio.duration_sec)
-
+            bitrate_kbps = _calc_bitrate_kbps(audio.filename, audio.duration_sec)
+            file_path = os.path.join("audio_files", audio.filename)
+            await sendspin_manager.seek_playback(file_path, position, bitrate_kbps)
+    
     global global_state
     global_state.position = position
-    global_state.last_updated = start_time
+    global_state.last_updated = time.time()
 
     broadcast_state()
-    mqtt_handler.publish_command(device_name, cmd)
     
-    if audio_id and 'audio' in locals() and audio:
-        file_path = os.path.join("audio_files", audio.filename)
-        await sendspin_manager.seek_playback(file_path, position, cmd.get("bitrate_kbps", 128))
-        
-    return {"message": "Seek command sent"}
+    return {"message": "Seek sent via Sendspin"}
 
 @app.post("/api/speed")
-def realtime_speed(device_name: str = Form("all"), speed: float = Form(1.0), user=Depends(require_auth)):
-    cmd = {
-        "action": "speed",
-        "speed": speed
-    }
-
+def realtime_speed(speed: float = Form(1.0), user=Depends(require_auth)):
+    """Speed change via Sendspin only (no MQTT)."""
     global global_state
-    # Snapshot current position before changing speed
     global_state.position = get_current_position()
     global_state.last_updated = time.time()
     global_state.speed = speed
 
     broadcast_state()
-    mqtt_handler.publish_command(device_name, cmd)
-    return {"message": "Speed command sent"}
+    return {"message": "Speed change sent via Sendspin"}
 
 @app.post("/api/volume")
-def realtime_volume(device_name: str = Form("all"), volume: int = Form(50), user=Depends(require_auth)):
-    cmd = {"action": "volume", "volume": volume}
-
+def realtime_volume(volume: int = Form(50), user=Depends(require_auth)):
+    """Volume change via Sendspin only (no MQTT)."""
     global global_state
     global_state.volume = volume
 
     broadcast_state()
-    mqtt_handler.publish_command(device_name, cmd)
+    
+    # Send volume command via Sendspin to all clients
+    if sendspin_manager.server:
+        for client in sendspin_manager.server.connected_clients:
+            try:
+                player = client.role("player@v1")
+                if player:
+                    player.send_message_type("server/command", {
+                        "player": {"volume": volume}
+                    })
+            except Exception:
+                pass
+    
     return {"status": "ok"}
 
 
@@ -944,3 +922,12 @@ def sendspin_status(user=Depends(require_auth)):
 @app.get("/api/sendspin/clients")
 def sendspin_clients(user=Depends(require_auth)):
     return sendspin_manager.get_client_status()
+
+@app.post("/api/sendspin/stop")
+async def sendspin_stop(user=Depends(require_auth)):
+    """
+    FIX v8.1: Add manual stop endpoint to trigger stream/end to all clients.
+    Previously stream/end was only sent on scheduled stops or file completion.
+    """
+    await sendspin_manager.stop_playback()
+    return {"status": "ok", "message": "Stream stopped"}

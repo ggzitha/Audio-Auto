@@ -11,13 +11,21 @@ document.addEventListener('DOMContentLoaded', () => {
         localStorage.setItem('sendspin_player_id', storedPlayerId);
     }
 
+    // Track late joiner state
+    let isLateJoiner = false;
+    let lateJoinerTargetPosition = 0;
+    
     window.sendspinPlayer = new SendspinJS.SendspinPlayer({
         playerId: storedPlayerId,
         clientName: 'Web App',
         baseUrl: `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.hostname}:8927`,
         onStateChange: (state) => {
-            // Update UI based on native state if needed
-            // However, we still rely on /api/state for the broader playlist context
+            // Handle late joiner: when stream starts playing, seek to current position
+            if (isLateJoiner && state === 'playing' && lateJoinerTargetPosition > 0) {
+                console.log('[Sendspin] Late joiner: seeking to', lateJoinerTargetPosition.toFixed(1), 's');
+                window.sendspinPlayer.seekTo(lateJoinerTargetPosition);
+                isLateJoiner = false;
+            }
         }
     });
 
@@ -176,6 +184,10 @@ document.addEventListener('DOMContentLoaded', () => {
     // ─── WebSocket ────────────────────────────────────────────────────────────
     let ws = null;
     let wsReconnectTimer = null;
+    // FIX v2.1: Add state update lock to prevent race conditions between
+    // WebSocket state updates and SendspinPlayer state changes.
+    let stateUpdateInProgress = false;
+    let pendingStateUpdate = null;
 
     function connectWebSocket() {
         if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
@@ -211,7 +223,24 @@ document.addEventListener('DOMContentLoaded', () => {
                         Swal.fire('Transcode Failed', `Failed to transcode ${data.file}`, 'error');
                     }
                 } else if (data.type === 'state') {
+                    // FIX v2.1: Use queue to prevent concurrent state updates
+                    if (stateUpdateInProgress) {
+                        pendingStateUpdate = data.state;
+                        return;
+                    }
+                    stateUpdateInProgress = true;
                     applyServerState(data.state);
+                    stateUpdateInProgress = false;
+                    // Process pending state if any
+                    if (pendingStateUpdate) {
+                        const nextState = pendingStateUpdate;
+                        pendingStateUpdate = null;
+                        setTimeout(() => {
+                            stateUpdateInProgress = true;
+                            applyServerState(nextState);
+                            stateUpdateInProgress = false;
+                        }, 0);
+                    }
                 }
             } catch (e) { console.error('WS message parse error:', e); }
         };
@@ -459,12 +488,12 @@ document.addEventListener('DOMContentLoaded', () => {
             });
         }
 
-        // Tell server to broadcast play command (ESP32 + other web clients)
-        pushStateChange('play', {
-            audio_id: id,
-            volume: window.globalState.volume,
-            position: 0
-        });
+        // Tell server to start playback via Sendspin (all clients receive audio via Sendspin)
+        const formData = new FormData();
+        formData.append('audio_id', id);
+        formData.append('volume', window.globalState.volume);
+        formData.append('position', 0);
+        fetch('/api/play', { method: 'POST', body: formData });
     };
 
     function togglePlay() {
@@ -767,25 +796,50 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         
+        // ─── Codec Selector ───────────────────────────────────────────────────────
+        // Ensure updateGlobalCodec is defined at global scope BEFORE any page loads
+        window.updateGlobalCodec = function() {
+            try {
+                const codecSelect = document.getElementById('codecSelect');
+                if (!codecSelect) {
+                    console.error('CodecSelect element not found');
+                    return;
+                }
+                const val = codecSelect.value;
+                console.log('Updating codec to:', val);
+                fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ codec: val })
+                })
+                .then(r => {
+                    if (!r.ok) throw new Error('HTTP ' + r.status);
+                    return r.json();
+                })
+                .then(res => {
+                    if (res.status === 'ok') {
+                        console.log('Codec successfully updated to', val);
+                    } else {
+                        console.error('Codec update failed:', res);
+                    }
+                })
+                .catch(e => console.error("Codec update error:", e));
+            } catch (err) {
+                console.error("updateGlobalCodec exception:", err);
+            }
+        };
+
+        // Load current codec setting on page init
         const codecSelect = document.getElementById('codecSelect');
         if (codecSelect) {
-            fetch('/api/settings').then(r => r.json()).then(settings => {
-                codecSelect.value = settings.codec || 'pcm';
-            }).catch(e => console.error("Settings fetch error:", e));
+            fetch('/api/settings')
+                .then(r => r.json())
+                .then(settings => {
+                    codecSelect.value = settings.codec || 'pcm';
+                    console.log('Loaded codec setting:', settings.codec);
+                })
+                .catch(e => console.error("Settings fetch error:", e));
         }
-
-        window.updateGlobalCodec = function() {
-            const val = document.getElementById('codecSelect').value;
-            fetch('/api/settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ codec: val })
-            }).then(r => r.json()).then(res => {
-                if (res.status === 'ok') {
-                    console.log('Codec updated to', val);
-                }
-            }).catch(e => console.error("Codec update error:", e));
-        };
 
         // No longer load devices into a <select>
         // We use Device Modal instead.

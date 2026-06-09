@@ -102,9 +102,13 @@ class Mp3Encoder:
         with av.logging.Capture():
             self._encoder.open()
 
+        # FIX v6.1: After encoder initialization, recalculate chunk_size to match
+        # the encoder's actual frame size. This prevents alignment issues when
+        # the resampler's output buffer size differs from the pre-calculated chunk_size.
         if self._encoder.frame_size:
             self._chunk_samples = self._encoder.frame_size
             self._chunk_duration_us = self._chunk_samples * 1_000_000 // self._sample_rate
+            self._frame_stride = (16 // 8) * self._channels  # Recalculate for new chunk_samples
 
         self._initialized = True
 
@@ -284,16 +288,31 @@ class FlacEncoder:
         assert self._encoder is not None
         av = _get_av()
 
-        frame = av.AudioFrame(
+        # FLAC encoder expects planar s16p format, not interleaved s16
+        # We need to use a resampler to convert interleaved PCM to planar
+        if not hasattr(self, '_resampler'):
+            self._resampler = av.AudioResampler(
+                format="s16p",  # Planar format for FLAC
+                layout="stereo" if self._channels == 2 else "mono",
+                rate=self._sample_rate,
+            )
+
+        # Create frame with interleaved s16 format
+        input_frame = av.AudioFrame(
             format="s16",
             layout="stereo" if self._channels == 2 else "mono",
             samples=self._chunk_samples,
         )
-        frame.sample_rate = self._sample_rate
-        frame.planes[0].update(chunk_pcm)
+        input_frame.sample_rate = self._sample_rate
+        input_frame.planes[0].update(chunk_pcm)
+
+        # Resample to planar format
+        planar_frame = self._resampler.resample(input_frame)
+        if planar_frame is None:
+            return b''
 
         output = bytearray()
-        packets = self._encoder.encode(frame)
+        packets = self._encoder.encode(planar_frame)
         for packet in packets:
             output.extend(bytes(packet))
         return bytes(output)
