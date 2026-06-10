@@ -1,0 +1,316 @@
+substitutions:
+  name: esp32s3-ruang-ins-lt1
+  friendly_name: E32s3-Ins-L1
+
+  # ── PCM5201A I2S pins (from your Arduino sketch) ─────────────────────────
+  i2s_bclk:  GPIO4
+  i2s_lrclk: GPIO5
+  spk:       GPIO6
+
+  # ── Misc ──────────────────────────────────────────────────────────────────
+  ota_password:   "illuminati"
+  key_encryption: "WHdGuZ7Acgmx6iFuoT08LPdsbDcsbbTG3rVIlojaWAE="
+
+  psram:   octal
+  flash:   16mb
+  bufsize: "500000"
+  bufdur:  100ms
+  task:    "true"
+
+  volmin: "0.3"
+  volmax: "1.0"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WiFi — same three APs as your Arduino sketch
+# ═══════════════════════════════════════════════════════════════════════════
+wifi:
+  networks:
+    # - ssid: "DCLXVI"
+    #   password: "1029384756"
+    - ssid: "BBWV_Oprasional"
+      password: "Balai5-OPRA123!"
+    - ssid: "BMKG-JAYAPURA"
+      password: "bmkg@123"
+    - ssid: "BMKG-JAYAPURA-TAMU"
+      password: "bmkg@123"
+  power_save_mode: none   # reduces jitter, matches WiFi.setSleep(false)
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: "fallback123"
+
+captive_portal:
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ESPHome / ESP32 core
+# ═══════════════════════════════════════════════════════════════════════════
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -100
+    then:
+      - logger.log: "Boot complete - Sendspin initialized"
+
+esp32:
+  board: esp32-s3-devkitc-1
+  cpu_frequency: 240MHz
+  variant: esp32s3
+  flash_size: ${flash}
+  framework:
+    type: esp-idf
+    version: recommended
+    sdkconfig_options:
+      # PSRAM / cache optimisations for N16R8 (octal PSRAM)
+      CONFIG_ESP32S3_DATA_CACHE_64KB:           "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B:       "y"
+      CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB:    "y"
+      CONFIG_SPIRAM_RODATA:                     "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS:         "y"
+      CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST:   "y"
+      CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY:         "y"
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC:        "y"
+      CONFIG_MBEDTLS_SSL_PROTO_TLS1_3:          "y"
+
+logger:
+  level: DEBUG
+  logs:
+    sendspin: DEBUG
+    sendspin.hub: DEBUG
+    mdns: DEBUG
+
+api:
+  encryption:
+    key: ${key_encryption}
+
+ota:
+  - platform: esphome
+    password: ${ota_password}
+
+psram:
+  mode: ${psram}
+  speed: 80MHz
+  ignore_not_found: false
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Audio codec memory optimization (matches working configs: a1s, lyratmini)
+# ═══════════════════════════════════════════════════════════════════════════
+audio:
+  codecs:
+    flac:
+      buffer_memory: internal
+    opus:
+      state_memory: internal
+      pseudostack:
+        threadsafe: false
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Globals
+# ═══════════════════════════════════════════════════════════════════════════
+globals:
+  - id: announcement_triggered
+    type: bool
+    initial_value: "false"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Sendspin hub
+# ═══════════════════════════════════════════════════════════════════════════
+sendspin:
+  id: sendspin_hub
+  task_stack_in_psram: ${task}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# I2S audio hardware
+# PCM5201A notes:
+#   • 3.3 V logic, no MCLK needed (uses BCK/SCK PLL internally)
+#   • 16-bit or 32-bit frames both work; 16-bit used here for simplicity
+#   • Left/right channel order is standard I2S MSB-first
+# ═══════════════════════════════════════════════════════════════════════════
+i2s_audio:
+  - id: i2s_output
+    i2s_lrclk_pin:
+      number: ${i2s_lrclk}
+    i2s_bclk_pin:
+      number: ${i2s_bclk}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Speaker chain
+#
+#   i2s_audio_speaker  ←  mixing_speaker  ←  announcement_mixing_input
+#                                          ←  media_mixing_input
+#                              ↑                      ↑
+#                  announcement_resampling_speaker   media_resampling_speaker
+# ═══════════════════════════════════════════════════════════════════════════
+speaker:
+
+  # ── Physical I2S output ───────────────────────────────────────────────────
+  - platform: i2s_audio
+    id: i2s_audio_speaker
+    i2s_audio_id: i2s_output
+    i2s_dout_pin:
+      number: ${spk}
+    # 32bit is standard I2S format and works better with most external DACs
+    # including PCM5102A/PCM5201A - matches working configs (sendspin.yaml, louder, a1s)
+    bits_per_sample: 32bit
+    dac_type: external
+    channel: stereo
+    sample_rate: 48000
+    timeout: never
+    buffer_duration: ${bufdur}
+
+  # ── Mixer: combines announcement + media into one stream ──────────────────
+  - platform: mixer
+    id: mixing_speaker
+    output_speaker: i2s_audio_speaker
+    num_channels: 2
+    source_speakers:
+      - id: announcement_mixing_input
+        timeout: never
+      - id: media_mixing_input
+        timeout: never
+
+  # ── Resamplers: normalise both pipelines to 48 kHz / 16-bit ──────────────
+  - platform: resampler
+    id: announcement_resampling_speaker
+    output_speaker: announcement_mixing_input
+    sample_rate: 48000
+    bits_per_sample: 16
+
+  - platform: resampler
+    id: media_resampling_speaker
+    output_speaker: media_mixing_input
+    sample_rate: 48000
+    bits_per_sample: 16
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Media sources
+# ═══════════════════════════════════════════════════════════════════════════
+media_source:
+  - platform: audio_http
+    id: http_announcement_source
+    buffer_size: 250000
+
+  - platform: audio_http
+    id: http_media_source
+    buffer_size: ${bufsize}
+
+  - platform: sendspin
+    id: sendspin_media_source
+    # Use internal memory for decode - matches working a1s/lyratmini configs
+    decode_memory: internal
+    # 2000 microseconds provides safety margin to prevent audio gaps/underruns
+    # 480µs is used by some configs, but 2000µs is safer for PCM5102A
+    fixed_delay: 2000 microseconds
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Media players
+# ═══════════════════════════════════════════════════════════════════════════
+media_player:
+
+  # Sendspin group player (receives sync'd stream from server)
+  - platform: sendspin
+    id: sendspin_player
+    name: "Group"
+
+  # Full-featured player (HTTP + Sendspin, announcements, volume control)
+  - platform: speaker_source
+    id: main_player
+    name: "Player"
+    internal: false
+    volume_increment: 0.05
+    volume_min: ${volmin}
+    volume_max: ${volmax}
+
+    announcement_pipeline:
+      format: FLAC
+      num_channels: 1
+      sample_rate: 48000
+      speaker: announcement_resampling_speaker
+      sources:
+        - http_announcement_source
+
+    media_pipeline:
+      format: FLAC
+      num_channels: 2
+      sample_rate: 48000
+      speaker: media_resampling_speaker
+      sources:
+        - http_media_source
+        - sendspin_media_source
+
+    on_play:
+      then:
+        - logger.log: "Playing"
+
+    on_idle:
+      then:
+        - logger.log: "Idle"
+
+    on_announcement:
+      then:
+        - globals.set:
+            id: announcement_triggered
+            value: "true"
+        - logger.log: "Announcement started - applying ducking"
+        - mixer_speaker.apply_ducking:
+            id: media_mixing_input
+            decibel_reduction: 20
+            duration: 0.0s
+
+    on_state:
+      if:
+        condition:
+          and:
+            - lambda: return (!id(announcement_triggered));
+            - not:
+                media_player.is_announcing: main_player
+        then:
+          - mixer_speaker.apply_ducking:
+              id: media_mixing_input
+              decibel_reduction: 0
+              duration: 1.0s
+          - globals.set:
+              id: announcement_triggered
+              value: "false"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Sendspin metadata sensors
+# ═══════════════════════════════════════════════════════════════════════════
+text_sensor:
+  - platform: sendspin
+    type: title
+    name: "Track Title"
+  - platform: sendspin
+    type: artist
+    name: "Artist"
+  - platform: sendspin
+    type: album
+    name: "Album"
+    
+  - platform: wifi_info
+    ip_address:
+      name: "Device IP"
+    ssid:
+      name: "Connected SSID"
+    power_save_mode:
+      name: "WiFi Power Save Mode"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Utility
+# ═══════════════════════════════════════════════════════════════════════════
+sensor:
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+  - platform: sendspin
+    name: "Year"
+    type: year
+  - platform: sendspin
+    type: track
+    name: "Track Number"
+
+
+switch:
+  - platform: restart
+    name: "Reboot"
+
+http_request:
