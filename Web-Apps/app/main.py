@@ -848,3 +848,53 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.receive_text()   # keep alive (ignore incoming)
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+
+
+# ─── Sendspin Client Cleanup API ───────────────────────────────────────────────
+# Track connected browser clients for Sendspin sync
+_sendspin_clients: dict = {}  # clientId → {group, joinedAt, lastSeen}
+
+@app.post("/api/sendspin/leave")
+async def sendspin_leave(request: Request, user=Depends(require_auth)):
+    """Handle browser tab close - remove client from group tracking."""
+    try:
+        body = await request.json()
+        client_id = body.get('clientId', '')
+        group = body.get('group', 'ESP32-Sync')
+        
+        if client_id in _sendspin_clients:
+            del _sendspin_clients[client_id]
+            print(f"[Sendspin] Client {client_id} left group {group}")
+        
+        return {"status": "ok", "removed": client_id}
+    except Exception as e:
+        print(f"[Sendspin] Leave error: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/sendspin/clients")
+async def sendspin_get_clients(user=Depends(require_auth)):
+    """Get list of connected Sendspin browser clients."""
+    return {"clients": list(_sendspin_clients.values()), "count": len(_sendspin_clients)}
+
+
+@app.post("/api/sendspin/join")
+async def sendspin_join(request: Request, user=Depends(require_auth)):
+    """Register a browser client joining a Sendspin group."""
+    try:
+        body = await request.json()
+        client_id = body.get('clientId', '')
+        group = body.get('group', 'ESP32-Sync')
+        
+        _sendspin_clients[client_id] = {
+            'clientId': client_id,
+            'group': group,
+            'joinedAt': time.time(),
+            'lastSeen': time.time(),
+        }
+        print(f"[Sendspin] Client {client_id} joined group {group}")
+        
+        return {"status": "ok", "registered": client_id}
+    except Exception as e:
+        print(f"[Sendspin] Join error: {e}")
+        return {"status": "error", "message": str(e)}
