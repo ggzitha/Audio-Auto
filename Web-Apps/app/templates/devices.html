@@ -4,33 +4,192 @@
 
 {% block content %}
 <div class="max-w-7xl mx-auto">
-    <div class="flex justify-between items-center mb-8">
-        <h2 class="text-3xl font-bold" data-i18n="devices">Devices</h2>
+    <!-- Header -->
+    <div class="flex justify-between items-end mb-8">
+        <div>
+            <h2 class="text-3xl font-bold mb-1" data-i18n="devices">ESP32 Players</h2>
+            <p class="text-gray-500 dark:text-gray-400 text-sm">
+                Real-time status via
+                <span class="text-green-500 font-semibold">
+                    <i class="fas fa-music mr-1"></i>Music Assistant
+                </span>
+            </p>
+        </div>
+        <button onclick="refreshPlayers()" class="flex items-center gap-2 px-4 py-2 rounded-xl bg-primary/10 hover:bg-primary/20 text-primary font-semibold transition-colors">
+            <i class="fas fa-sync-alt" id="refreshIcon"></i> Refresh
+        </button>
     </div>
 
+    <!-- MA Connection status badge -->
+    <div id="maConnBadge" class="flex items-center gap-2 mb-6 text-sm">
+        <span class="w-2 h-2 rounded-full bg-gray-400 inline-block" id="maConnDot"></span>
+        <span id="maConnText" class="text-gray-500">Connecting to Music Assistant…</span>
+    </div>
 
-
-    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6" id="deviceGrid">
-        <!-- Devices injected via JS -->
+    <!-- Players grid -->
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6" id="maPlayerGrid">
+        <div class="col-span-full flex justify-center items-center py-20 text-gray-400">
+            <div class="text-center">
+                <i class="fas fa-spinner fa-spin text-4xl mb-4 block text-primary/50"></i>
+                <p>Discovering MA players…</p>
+            </div>
+        </div>
     </div>
 </div>
 
 <script>
-// ─── Device log handler ──────────────────────────────────────────────────────
-window.addEventListener('deviceLog', function(e) {
-    const data = e.detail;
-    if (data.device === 'Web App') return;
-    const term = document.getElementById('term-' + data.device);
-    if (term) {
-        const line = document.createElement('div');
-        line.innerText = data.msg;
-        term.appendChild(line);
-        if (term.children.length > 50) term.removeChild(term.firstChild);
-        term.scrollTop = term.scrollHeight;
-    }
-});
+function refreshPlayers() {
+    const icon = document.getElementById('refreshIcon');
+    if (icon) { icon.classList.add('fa-spin'); }
 
+    fetch('/api/ma/status').then(r => r.json()).then(st => {
+        const dot  = document.getElementById('maConnDot');
+        const txt  = document.getElementById('maConnText');
+        if (dot) dot.className = `w-2 h-2 rounded-full inline-block ${st.connected ? 'bg-green-500' : 'bg-red-400 animate-pulse'}`;
+        if (txt) txt.textContent = st.connected ? `Connected to ${st.ma_url} — Group: ${st.group_player_name}` : 'Music Assistant disconnected';
+    }).catch(() => {});
 
+    fetch('/api/ma/players').then(r => r.json()).then(players => {
+        const grid = document.getElementById('maPlayerGrid');
+        if (!grid) return;
+
+        // Update global state
+        players.forEach(p => { window.maState.players[p.player_id] = p; });
+
+        const syncPlayers = players.filter(p => p.in_sync_group || p.is_group);
+
+        if (syncPlayers.length === 0) {
+            grid.innerHTML = `
+                <div class="col-span-full text-center py-20 text-gray-400">
+                    <i class="fas fa-wifi text-5xl mb-4 block opacity-30"></i>
+                    <p class="text-lg font-medium mb-2">No ESP32-Sync players discovered</p>
+                    <p class="text-sm">Ensure Music Assistant is running and ESP32 devices are online.</p>
+                </div>`;
+            if (icon) icon.classList.remove('fa-spin');
+            return;
+        }
+
+        grid.innerHTML = syncPlayers.map(p => {
+            const state   = p.playback_state || 'idle';
+            const avail   = p.available;
+            const vol     = p.group_volume ?? p.volume_level ?? 0;
+            const media   = p.current_media;
+
+            const stateInfo = {
+                playing: { icon: 'fa-play',  color: 'green',  label: 'Playing' },
+                paused:  { icon: 'fa-pause', color: 'yellow', label: 'Paused' },
+                idle:    { icon: 'fa-stop',  color: 'gray',   label: 'Idle' },
+                unknown: { icon: 'fa-question', color: 'gray', label: 'Unknown' },
+            };
+            const si = stateInfo[state] || stateInfo['unknown'];
+
+            const elapsed = p.elapsed_time || 0;
+            const dur     = media ? media.duration : 0;
+            const pct     = dur > 0 ? Math.min((elapsed / dur) * 100, 100) : 0;
+
+            return `
+                <div class="glass rounded-2xl p-5 shadow-xl border border-white/10 flex flex-col gap-4 transition-transform hover:scale-[1.01]">
+                    <!-- Header -->
+                    <div class="flex items-center justify-between">
+                        <div class="flex items-center gap-3">
+                            <div class="w-12 h-12 rounded-xl bg-gradient-to-br from-blue-500/30 to-purple-500/30 flex items-center justify-center shadow-inner">
+                                <i class="fas ${p.is_group ? 'fa-layer-group' : 'fa-volume-up'} text-blue-400 text-lg"></i>
+                            </div>
+                            <div>
+                                <h3 class="font-bold text-gray-900 dark:text-white text-base leading-tight">${p.name}</h3>
+                                <p class="text-xs text-gray-400 font-mono">${p.player_id}</p>
+                            </div>
+                        </div>
+                        <div class="flex flex-col items-end gap-1">
+                            <span class="px-2 py-0.5 rounded-full text-xs font-semibold ${avail ? `bg-${si.color}-100 dark:bg-${si.color}-900/30 text-${si.color}-700 dark:text-${si.color}-300` : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'}">
+                                <i class="fas ${avail ? si.icon : 'fa-wifi'} mr-1"></i>${avail ? si.label : 'Offline'}
+                            </span>
+                            ${p.is_group ? '<span class="text-xs text-blue-500 dark:text-blue-400 font-medium">Group Player</span>' : ''}
+                        </div>
+                    </div>
+
+                    <!-- Now Playing -->
+                    <div class="bg-gray-50 dark:bg-gray-800/50 rounded-xl p-3 min-h-[56px] flex flex-col justify-center">
+                        ${media ? `
+                            <p class="font-semibold text-sm text-gray-800 dark:text-gray-200 truncate">${media.title || 'Now Playing'}</p>
+                            ${media.artist ? `<p class="text-xs text-gray-500 truncate">${media.artist}</p>` : ''}
+                            <!-- Progress -->
+                            <div class="mt-2 flex items-center gap-2 text-xs text-gray-400">
+                                <span class="font-mono">${fmtTime(elapsed)}</span>
+                                <div class="flex-1 h-1 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+                                    <div class="h-full bg-primary rounded-full" style="width:${pct}%"></div>
+                                </div>
+                                <span class="font-mono">${fmtTime(dur)}</span>
+                            </div>
+                        ` : '<p class="text-sm text-gray-400 italic">Nothing playing</p>'}
+                    </div>
+
+                    <!-- Volume -->
+                    <div class="flex items-center gap-3">
+                        <i class="fas fa-volume-down text-gray-400 text-sm w-4 text-center"></i>
+                        <div class="flex-1 h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+                            <div class="h-full rounded-full transition-all ${vol > 70 ? 'bg-green-500' : vol > 30 ? 'bg-primary' : 'bg-yellow-500'}" style="width:${vol}%"></div>
+                        </div>
+                        <i class="fas fa-volume-up text-gray-400 text-sm w-4 text-center"></i>
+                        <span class="text-xs font-mono text-gray-500 w-8">${vol}%</span>
+                    </div>
+
+                    <!-- Controls -->
+                    <div class="flex gap-2">
+                        <button onclick="devCmd('play_pause','${p.player_id}')"
+                                class="flex-1 py-2 rounded-xl text-xs font-semibold transition-colors
+                                       ${state === 'playing' ? 'bg-yellow-100 dark:bg-yellow-900/20 text-yellow-600 hover:bg-yellow-200' : 'bg-green-100 dark:bg-green-900/20 text-green-600 hover:bg-green-200'}">
+                            <i class="fas ${state === 'playing' ? 'fa-pause' : 'fa-play'} mr-1"></i>
+                            ${state === 'playing' ? 'Pause' : 'Play'}
+                        </button>
+                        <button onclick="devCmd('stop','${p.player_id}')"
+                                class="flex-1 py-2 rounded-xl bg-red-100 dark:bg-red-900/20 hover:bg-red-200 text-red-600 text-xs font-semibold transition-colors">
+                            <i class="fas fa-stop mr-1"></i>Stop
+                        </button>
+                        <button onclick="devCmd('next','${p.player_id}')"
+                                class="py-2 px-3 rounded-xl bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 text-gray-600 dark:text-gray-400 text-xs transition-colors">
+                            <i class="fas fa-step-forward"></i>
+                        </button>
+                    </div>
+
+                    ${p.is_group && p.group_members && p.group_members.length ? `
+                    <div class="border-t border-gray-100 dark:border-gray-700 pt-3">
+                        <p class="text-xs text-gray-400 mb-1.5 font-medium">Group members (${p.group_members.length})</p>
+                        <div class="flex flex-wrap gap-1">
+                            ${p.group_members.map(m => `<span class="px-2 py-0.5 text-xs bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-300 rounded-full">${players.find(x=>x.player_id===m)?.name || m}</span>`).join('')}
+                        </div>
+                    </div>
+                    ` : ''}
+                </div>`;
+        }).join('');
+
+        if (icon) icon.classList.remove('fa-spin');
+
+    }).catch(err => {
+        console.error('[Devices] load error:', err);
+        if (icon) icon.classList.remove('fa-spin');
+    });
+}
+
+function devCmd(cmd, playerId) {
+    const fd = new FormData();
+    fd.append('player_id', playerId);
+    fetch('/api/ma/' + cmd, { method: 'POST', body: fd })
+        .then(() => setTimeout(refreshPlayers, 600));
+}
+
+function fmtTime(sec) {
+    if (!sec || isNaN(sec)) return '0:00';
+    const m = Math.floor(sec / 60);
+    const s = Math.floor(sec % 60);
+    return `${m}:${s.toString().padStart(2,'0')}`;
+}
+
+// Auto-refresh on WS events too
+window.addEventListener('DOMContentLoaded', refreshPlayers);
+window.addEventListener('maPlayerUpdate', refreshPlayers);
+
+// Refresh every 5s
+window._devicesRefreshInterval = setInterval(refreshPlayers, 5000);
 </script>
 {% endblock %}
-

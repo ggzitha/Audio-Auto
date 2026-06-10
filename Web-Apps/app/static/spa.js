@@ -1,135 +1,52 @@
 // app/static/spa.js
-// COMPLETE REWRITE - fixes SPA audio continuity, cross-client sync, and all known bugs.
+// Audio-Auto — Music Assistant Edition
+// All playback is controlled via /api/ma/* which proxies to Music Assistant.
+// Real-time state comes from MA WebSocket events forwarded by our /ws endpoint.
+
 document.addEventListener('DOMContentLoaded', () => {
 
-    const mainContent = document.getElementById('spa-content');
+    // ─── Global MA State ───────────────────────────────────────────────────────
+    window.maState = {
+        players: {},           // player_id → player object (from MA)
+        groupPlayerId: null,   // resolved group player_id ("ESP32-Sync")
+        selectedPlayerId: null,// currently selected player
+        connected: false,      // MA WS connected?
+    };
+
+    window.allFiles  = [];
+    window.playQueue = [];     // local file order (for next/prev)
+
+    // ─── Element references ────────────────────────────────────────────────────
     const bottomPlayer = document.getElementById('bottom-player');
-    // ─── Native SendspinPlayer Integration ────────────────────────────────────
-    let storedPlayerId = localStorage.getItem('sendspin_player_id');
-    if (!storedPlayerId) {
-        storedPlayerId = 'webapp-' + Math.random().toString(36).substr(2, 9);
-        localStorage.setItem('sendspin_player_id', storedPlayerId);
-    }
-
-    // Track late joiner state
-    let isLateJoiner = false;
-    let lateJoinerTargetPosition = 0;
-    
-    window.sendspinPlayer = new SendspinJS.SendspinPlayer({
-        playerId: storedPlayerId,
-        clientName: 'Web App',
-        baseUrl: `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.hostname}:8927`,
-        onStateChange: (state) => {
-            // Handle late joiner: when stream starts playing, seek to current position
-            if (isLateJoiner && state === 'playing' && lateJoinerTargetPosition > 0) {
-                console.log('[Sendspin] Late joiner: seeking to', lateJoinerTargetPosition.toFixed(1), 's');
-                window.sendspinPlayer.seekTo(lateJoinerTargetPosition);
-                isLateJoiner = false;
-            }
-        }
-    });
-
-    window.sendspinPlayer.connect().catch(e => console.error('Sendspin connect error:', e));
-
-    const resumeAudioCtx = () => {
-        const ctx = window.sendspinPlayer?.scheduler?.audioContext;
-        if (ctx && ctx.state === 'suspended') {
-            ctx.resume().then(() => {
-                console.log('[Audio] AudioContext resumed via user interaction');
-                hideAudioJoinOverlay();
-            });
-        }
-    };
-
-    // Resume on ANY user interaction — covers late joiners
-    ['click', 'touchstart', 'keydown', 'pointerdown'].forEach(evt => {
-        document.addEventListener(evt, resumeAudioCtx, { passive: true });
-    });
-
-    // ─── Audio Join Overlay Logic ─────────────────────────────────────────────
-    const audioJoinOverlay = document.getElementById('audioJoinOverlay');
-    const audioJoinBtn = document.getElementById('audioJoinBtn');
-    let overlayShown = false;
-
-    function showAudioJoinOverlay() {
-        if (audioJoinOverlay && !overlayShown) {
-            audioJoinOverlay.classList.remove('hidden');
-            overlayShown = true;
-        }
-    }
-
-    function hideAudioJoinOverlay() {
-        if (audioJoinOverlay) {
-            audioJoinOverlay.classList.add('hidden');
-            overlayShown = false;
-        }
-    }
-
-    if (audioJoinBtn) {
-        audioJoinBtn.addEventListener('click', () => {
-            resumeAudioCtx();
-            hideAudioJoinOverlay();
-        });
-    }
-
-    // Periodically check if AudioContext is suspended while playback is active
-    setInterval(() => {
-        const ctx = window.sendspinPlayer?.scheduler?.audioContext;
-        if (ctx && ctx.state === 'suspended' && window.globalState?.is_playing) {
-            showAudioJoinOverlay();
-        } else if (ctx && ctx.state === 'running') {
-            hideAudioJoinOverlay();
-        }
-    }, 500);
-    // ─── Global Playback State ────────────────────────────────────────────────
-    window.globalState = {
-        audio_id: null,
-        is_playing: false,
-        position: 0,       // position at last_updated
-        volume: 50,
-        previousVolume: 50,
-        speed: 1.0,
-        deviceLogs: {},    // Persist logs across SPA navigations
-        autoScroll: {},    // Auto-scroll state per device
-        last_updated: 0,   // server unix timestamp when position was captured
-        server_time: 0,    // server's clock at time of broadcast
-        current_position: 0
-    };
-
-    window.allFiles = [];
-    window.playTimeoutId = null;
-
-    // localAudio removed, handled by SendspinPlayer
-
-    // ─── WaveSurfer (singleton, lives forever) ────────────────────────────────
-    let wavesurfer = null;
-    let wavesurferInitialized = false;
-    let currentLoadedAudioId = null;
-    // Persistent container so WaveSurfer doesn't get destroyed on SPA nav
-    let globalWaveformContainer = document.createElement('div');
-    globalWaveformContainer.id = "persistentWaveform";
-
-    // ─── Mini-player element refs ─────────────────────────────────────────────
-    const miniBtnPlay = document.getElementById('miniBtnPlay');
-    const miniPlayIcon = document.getElementById('miniPlayIcon');
-    const miniBtnNext = document.getElementById('miniBtnNext');
-    const miniBtnPrev = document.getElementById('miniBtnPrev');
     const miniSongTitle = document.getElementById('miniSongTitle');
     const miniTimeElapsed = document.getElementById('miniTimeElapsed');
-    const miniTimeTotal = document.getElementById('miniTimeTotal');
+    const miniTimeTotal   = document.getElementById('miniTimeTotal');
     const miniProgressOverlay = document.getElementById('miniProgressOverlay');
-    const miniProgressBarContainer = document.getElementById('miniProgressBarContainer');
-    const miniVolSlider = document.getElementById('miniVolSlider');
+    const miniVolSlider  = document.getElementById('miniVolSlider');
+    const miniPlayIcon   = document.getElementById('miniPlayIcon');
+    const miniBtnPlay    = document.getElementById('miniBtnPlay');
+    const miniBtnNext    = document.getElementById('miniBtnNext');
+    const miniBtnPrev    = document.getElementById('miniBtnPrev');
 
-    // ─── Routing ──────────────────────────────────────────────────────────────
+    // ─── WaveSurfer (Visual + Audio Output) ───────────────────────────────────
+    let wavesurfer = null;
+    let wavesurferInitialized = false;
+    let currentLoadedFileId   = null;
+    let globalWaveformContainer = document.createElement('div');
+    globalWaveformContainer.id = 'persistentWaveform';
+
+    // ─── SPA Routing ──────────────────────────────────────────────────────────
+    const mainContent = document.getElementById('spa-content');
+
     function updatePlayerVisibility(url) {
-        // Show mini player on all pages EXCEPT the dashboard (which has the full player)
+        if (!bottomPlayer) return;
         if (url === '/' || url === '') {
-            if (bottomPlayer) bottomPlayer.classList.add('hidden');
+            bottomPlayer.classList.add('hidden');
         } else {
-            if (bottomPlayer && window.globalState.audio_id) {
-                bottomPlayer.classList.remove('hidden');
-            }
+            const playing = Object.values(window.maState.players).some(
+                p => p.playback_state === 'playing' || p.playback_state === 'paused'
+            );
+            if (playing) bottomPlayer.classList.remove('hidden');
         }
     }
 
@@ -142,14 +59,11 @@ document.addEventListener('DOMContentLoaded', () => {
         fetch(url)
             .then(r => r.text())
             .then(html => {
-                const parser = new DOMParser();
-                const doc = parser.parseFromString(html, 'text/html');
+                const parser  = new DOMParser();
+                const doc     = parser.parseFromString(html, 'text/html');
                 const newContent = doc.getElementById('spa-content');
                 if (newContent && mainContent) {
                     mainContent.innerHTML = newContent.innerHTML;
-
-                    // CRITICAL FIX: Browser does NOT execute <script> tags injected
-                    // via innerHTML. We must manually re-create and append each one.
                     mainContent.querySelectorAll('script').forEach(oldScript => {
                         const newScript = document.createElement('script');
                         if (oldScript.src) {
@@ -160,7 +74,6 @@ document.addEventListener('DOMContentLoaded', () => {
                         document.body.appendChild(newScript);
                         document.body.removeChild(newScript);
                     });
-
                     if (window.applyLanguage) window.applyLanguage();
                     window.initPageScripts(url);
                     updatePlayerVisibility(url);
@@ -169,9 +82,7 @@ document.addEventListener('DOMContentLoaded', () => {
             .catch(e => console.error('SPA load error:', e));
     }
 
-    window.addEventListener('popstate', () => {
-        loadPage(location.pathname);
-    });
+    window.addEventListener('popstate', () => loadPage(location.pathname));
 
     document.body.addEventListener('click', e => {
         const link = e.target.closest('a.spa-link');
@@ -181,595 +92,757 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    // ─── WebSocket ────────────────────────────────────────────────────────────
+    // ─── WebSocket (our /ws — relays MA events) ───────────────────────────────
     let ws = null;
     let wsReconnectTimer = null;
-    // FIX v2.1: Add state update lock to prevent race conditions between
-    // WebSocket state updates and SendspinPlayer state changes.
-    let stateUpdateInProgress = false;
-    let pendingStateUpdate = null;
 
     function connectWebSocket() {
         if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(`${protocol}//${location.host}/ws`);
 
         ws.onopen = () => {
-            console.log('WebSocket connected');
+            console.log('[WS] Connected');
+            const st = document.getElementById('infoWsStatus');
+            if (st) { st.textContent = 'Connected'; st.className = 'text-xs font-semibold text-green-500'; }
         };
 
-        ws.onmessage = (event) => {
+        ws.onmessage = (evt) => {
             try {
-                const data = JSON.parse(event.data);
-                if (data.type === 'log') {
-                    if (!window.globalState.deviceLogs) window.globalState.deviceLogs = {};
-                    if (!window.globalState.deviceLogs[data.device]) window.globalState.deviceLogs[data.device] = [];
-                    window.globalState.deviceLogs[data.device].push(`[${new Date().toLocaleTimeString()}] ${data.text}`);
-                    if (window.globalState.deviceLogs[data.device].length > 50) window.globalState.deviceLogs[data.device].shift();
-                    window.dispatchEvent(new CustomEvent('deviceLog', { detail: data }));
-                } else if (data.type === 'transcode_progress') {
-                    if (data.status === 'started') {
-                        Swal.fire({
-                            title: 'Transcoding Audio',
-                            html: `<div class="text-sm mb-4">Processing <b>${data.file}</b>...</div><div class="flex justify-center"><i class="fas fa-cog fa-spin text-4xl text-primary"></i></div>`,
-                            allowOutsideClick: false,
-                            showConfirmButton: false,
-                            customClass: { popup: 'glass' }
-                        });
-                    } else if (data.status === 'done') {
-                        Swal.fire({ toast: true, position: 'top-end', icon: 'success', title: 'Transcoding complete', text: data.file, showConfirmButton: false, timer: 3000, customClass: { popup: 'glass' } });
-                        fetch('/api/files').then(r => r.json()).then(files => { window.allFiles = files; renderPlaylist(files); });
-                    } else if (data.status === 'error') {
-                        Swal.fire('Transcode Failed', `Failed to transcode ${data.file}`, 'error');
-                    }
-                } else if (data.type === 'state') {
-                    // FIX v2.1: Use queue to prevent concurrent state updates
-                    if (stateUpdateInProgress) {
-                        pendingStateUpdate = data.state;
-                        return;
-                    }
-                    stateUpdateInProgress = true;
-                    applyServerState(data.state);
-                    stateUpdateInProgress = false;
-                    // Process pending state if any
-                    if (pendingStateUpdate) {
-                        const nextState = pendingStateUpdate;
-                        pendingStateUpdate = null;
-                        setTimeout(() => {
-                            stateUpdateInProgress = true;
-                            applyServerState(nextState);
-                            stateUpdateInProgress = false;
-                        }, 0);
-                    }
-                }
-            } catch (e) { console.error('WS message parse error:', e); }
+                const msg = JSON.parse(evt.data);
+                handleWsMessage(msg);
+            } catch (e) {
+                console.error('[WS] Parse error:', e);
+            }
         };
 
         ws.onclose = () => {
             wsReconnectTimer = setTimeout(connectWebSocket, 3000);
         };
-
-        ws.onerror = () => {
-            ws.close();
-        };
+        ws.onerror = () => ws.close();
     }
 
-    // ─── State Sync Logic ─────────────────────────────────────────────────────
-    function applyServerState(state) {
-        window.globalState = { ...window.globalState, ...state };
+    function handleWsMessage(msg) {
+        const t = msg.type;
 
-        // Compute actual current playback position
-        let actualPosition = state.position || 0;
-        let delayMs = 0;
-        if (state.is_playing && state.last_updated > 0 && state.server_time > 0) {
-            const timeUntilStart = state.last_updated - state.server_time;
-            if (timeUntilStart > 0) {
-                delayMs = timeUntilStart * 1000;
-                actualPosition = state.position || 0;
-            } else {
-                const elapsed = -timeUntilStart;
-                actualPosition = (state.position || 0) + elapsed * (state.speed || 1.0);
-            }
-            actualPosition = Math.max(0, actualPosition);
-        }
-        window.globalState.current_position = actualPosition;
-
-        // Load new audio file into wavesurfer (visual only)
-        const fileObj = window.allFiles.find(f => f.id === state.audio_id);
-        if (fileObj && state.audio_id !== currentLoadedAudioId) {
-            currentLoadedAudioId = state.audio_id;
-            if (wavesurfer) {
-                wavesurfer.load(`/audio_files/${encodeURIComponent(fileObj.filename)}`).catch(e => {
-                    if (e.name !== 'AbortError') console.error(e);
+        if (t === 'ma_players_snapshot') {
+            // Initial snapshot on WS connect
+            if (Array.isArray(msg.players)) {
+                msg.players.forEach(p => {
+                    window.maState.players[p.player_id] = p;
                 });
+                _resolveGroupPlayer();
+                updateUIFromMA();
+            }
+
+        } else if (t === 'ma_player') {
+            const p = msg.player;
+            if (!p || !p.player_id) return;
+            window.maState.players[p.player_id] = p;
+            if (msg.event === 'player_removed') {
+                delete window.maState.players[p.player_id];
+            }
+            _resolveGroupPlayer();
+            updateUIFromMA();
+
+        } else if (t === 'ma_queue_time') {
+            // High-frequency position update
+            const d = msg.data || {};
+            const qid = d.queue_id;
+            if (!qid) return;
+            // Find player matching this queue_id and update elapsed time
+            const activePlayer = getActivePlayer();
+            if (activePlayer && (activePlayer.player_id === qid || activePlayer.current_queue_id === qid)) {
+                activePlayer.elapsed_time = d.elapsed_time;
+                activePlayer.elapsed_time_last_updated = d.elapsed_time_last_updated || (Date.now() / 1000);
+            }
+            _updateProgressBar();
+
+        } else if (t === 'transcode_progress') {
+            if (msg.status === 'started') {
+                Swal.fire({
+                    title: 'Transcoding Audio',
+                    html: `<div class="text-sm mb-4">Processing <b>${msg.file}</b>...</div><div class="flex justify-center"><i class="fas fa-cog fa-spin text-4xl text-primary"></i></div>`,
+                    allowOutsideClick: false,
+                    showConfirmButton: false,
+                    customClass: { popup: 'glass' },
+                });
+            } else if (msg.status === 'done') {
+                Swal.fire({ toast: true, position: 'top-end', icon: 'success', title: 'Transcoding complete', text: msg.file, showConfirmButton: false, timer: 3000 });
+                fetch('/api/files').then(r => r.json()).then(files => {
+                    window.allFiles = files;
+                    const pc = document.getElementById('playlistContainer');
+                    if (pc) renderPlaylist(files);
+                });
+            } else if (msg.status === 'error') {
+                Swal.fire('Transcode Failed', `Failed to transcode ${msg.file}`, 'error');
+            }
+        }
+    }
+
+    function _resolveGroupPlayer() {
+        const cached = Object.values(window.maState.players).find(p =>
+            (p.is_group || p.type === 'group') &&
+            (p.player_id === window.maState.groupPlayerId ||
+             p.in_sync_group ||
+             (p.name || '').toLowerCase().includes('esp32'))
+        );
+        if (cached) {
+            window.maState.groupPlayerId = cached.player_id;
+            if (!window.maState.selectedPlayerId) {
+                window.maState.selectedPlayerId = cached.player_id;
+            }
+        }
+    }
+
+    // ─── Helper: get current active player ────────────────────────────────────
+    function getActivePlayer() {
+        const pid = window.maState.selectedPlayerId || window.maState.groupPlayerId;
+        return pid ? (window.maState.players[pid] || null) : null;
+    }
+
+    function getSelectedPlayerId() {
+        return window.maState.selectedPlayerId || window.maState.groupPlayerId || 'ESP32-Sync';
+    }
+
+    // ─── UI update from MA state ───────────────────────────────────────────────
+    function updateUIFromMA() {
+        const player = getActivePlayer();
+        if (!player) return;
+
+        const isPlaying = player.playback_state === 'playing';
+        const isPaused  = player.playback_state === 'paused';
+        const media     = player.current_media;
+
+        // Song title from MA current_media
+        let title = 'Ready';
+        let artist = 'Audio-Auto → Music Assistant';
+        if (media) {
+            title  = media.title || _filenameToTitle(media.uri || '') || 'Playing…';
+            artist = media.artist || (isPlaying ? 'Playing via MA' : 'Paused');
+        }
+
+        if (miniSongTitle) miniSongTitle.textContent = title;
+        if (miniPlayIcon) {
+            miniPlayIcon.className = isPlaying
+                ? 'fas fa-pause-circle text-2xl md:text-3xl'
+                : 'fas fa-play-circle text-2xl md:text-3xl';
+        }
+
+        // Big player on dashboard
+        const bigTitle = document.getElementById('nowPlaying');
+        if (bigTitle) bigTitle.textContent = title;
+        const bigArtist = document.getElementById('nowPlayingArtist');
+        if (bigArtist) bigArtist.textContent = artist;
+
+        const bigPlayIcon = document.getElementById('playIcon');
+        if (bigPlayIcon) {
+            bigPlayIcon.className = isPlaying
+                ? 'fas fa-pause-circle text-5xl md:text-6xl drop-shadow-md'
+                : 'fas fa-play-circle text-5xl md:text-6xl drop-shadow-md';
+        }
+
+        // Volume
+        const vol = player.group_volume ?? player.volume_level ?? 50;
+        const volSlider = document.getElementById('volSlider');
+        if (volSlider && document.activeElement !== volSlider) volSlider.value = vol;
+        if (miniVolSlider && document.activeElement !== miniVolSlider) miniVolSlider.value = vol;
+
+        // WaveSurfer: load audio if track changed
+        if (media && media.uri) {
+            // Try to match MA URI to a local file
+            const matchedFile = _matchUriToFile(media.uri);
+            if (matchedFile && matchedFile.id !== currentLoadedFileId && wavesurfer) {
+                currentLoadedFileId = matchedFile.id;
+                const src = `/audio_files/${encodeURIComponent(matchedFile.filename)}`;
+                wavesurfer.load(src).then(() => {
+                    const ap = getActivePlayer();
+                    if (ap && ap.playback_state === 'playing') wavesurfer.play();
+                }).catch(e => { if (e.name !== 'AbortError') console.warn(e); });
+                // Highlight in playlist
+                _highlightPlaylist(matchedFile.id);
+            }
+            // Duration from media
+            if (media.duration && miniTimeTotal) {
+                miniTimeTotal.textContent = formatTime(media.duration);
+                const timeTotal = document.getElementById('timeTotal');
+                if (timeTotal) timeTotal.textContent = formatTime(media.duration);
             }
         }
 
-        // Sync volume
-        if (state.volume !== undefined && window.sendspinPlayer) {
-            window.sendspinPlayer.setVolume(state.volume);
+        // Sync local playback state
+        if (wavesurfer && currentLoadedFileId) {
+            if (isPlaying && !wavesurfer.isPlaying()) {
+                wavesurfer.play().catch(e => console.warn('Browser autoplay prevented:', e));
+            } else if (!isPlaying && wavesurfer.isPlaying()) {
+                wavesurfer.pause();
+            }
         }
 
-        updateUIFromState();
+        // Mini-player bar visibility
+        if ((isPlaying || isPaused) && location.pathname !== '/') {
+            if (bottomPlayer) bottomPlayer.classList.remove('hidden');
+        }
+
+        // MA status panel
+        _updateMaStatusPanel();
     }
 
-    // ─── UI Update ────────────────────────────────────────────────────────────
+    function _updateProgressBar() {
+        const player = getActivePlayer();
+        if (!player) return;
+        let elapsed = player.elapsed_time || 0;
+        const lastUpd = player.elapsed_time_last_updated || 0;
+        if (player.playback_state === 'playing' && lastUpd > 0) {
+            elapsed += (Date.now() / 1000) - lastUpd;
+        }
+
+        const dur = (player.current_media && player.current_media.duration) || 0;
+
+        if (miniTimeElapsed) miniTimeElapsed.textContent = formatTime(elapsed);
+        const timeElapsed = document.getElementById('timeElapsed');
+        if (timeElapsed) timeElapsed.textContent = formatTime(elapsed);
+
+        if (dur > 0) {
+            const pct = Math.min((elapsed / dur) * 100, 100);
+            if (miniProgressOverlay) miniProgressOverlay.style.width = pct + '%';
+            // WaveSurfer visual & audio position sync
+            if (wavesurfer && wavesurfer.getDuration() > 0) {
+                const wsTime = wavesurfer.getCurrentTime();
+                if (Math.abs(wsTime - elapsed) > 0.5) {
+                    wavesurfer.seekTo(elapsed / wavesurfer.getDuration());
+                }
+            }
+        }
+    }
+
+    // Live progress ticker
+    setInterval(_updateProgressBar, 250);
+
+    function _updateMaStatusPanel() {
+        const panel = document.getElementById('maStatusPanel');
+        if (!panel) return;
+        const players = Object.values(window.maState.players);
+        if (players.length === 0) {
+            panel.innerHTML = '<div class="text-sm text-gray-500 text-center py-4">No MA players discovered yet…</div>';
+            return;
+        }
+        panel.innerHTML = players
+            .filter(p => p.in_sync_group || p.is_group)
+            .map(p => {
+                const state = p.playback_state || 'idle';
+                const vol   = p.group_volume ?? p.volume_level ?? '?';
+                const stateColors = {
+                    playing: 'text-green-500',
+                    paused:  'text-yellow-500',
+                    idle:    'text-gray-400',
+                    unknown: 'text-gray-400',
+                };
+                const stateIcons = {
+                    playing: 'fa-play',
+                    paused:  'fa-pause',
+                    idle:    'fa-stop',
+                    unknown: 'fa-question',
+                };
+                const color = stateColors[state] || 'text-gray-400';
+                const icon  = stateIcons[state]  || 'fa-question';
+                return `
+                    <div class="flex justify-between items-center p-2 rounded-lg bg-gray-50 dark:bg-gray-800 border border-gray-100 dark:border-gray-700 mb-2">
+                        <div class="flex items-center gap-2">
+                            <i class="fas ${icon} ${color} text-sm w-4 text-center"></i>
+                            <span class="font-medium text-sm">${p.name || p.player_id}</span>
+                            ${p.is_group ? '<span class="text-xs px-1.5 py-0.5 bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 rounded">Group</span>' : ''}
+                        </div>
+                        <div class="flex items-center gap-3 text-xs font-mono">
+                            <span class="${color}">${state}</span>
+                            <span class="text-gray-500"><i class="fas fa-volume-up mr-1"></i>${vol}%</span>
+                        </div>
+                    </div>
+                `;
+            }).join('') || '<div class="text-sm text-gray-500 text-center py-4">No ESP32-Sync players visible.</div>';
+    }
+
+    // ─── Helpers ──────────────────────────────────────────────────────────────
     function formatTime(seconds) {
-        if (isNaN(seconds) || !isFinite(seconds) || seconds < 0) return "0:00";
+        if (isNaN(seconds) || !isFinite(seconds) || seconds < 0) return '0:00';
         const m = Math.floor(seconds / 60);
         const s = Math.floor(seconds % 60);
         return `${m}:${s.toString().padStart(2, '0')}`;
     }
 
-    function updateUIFromState() {
-        const state = window.globalState;
-
-        // Song title
-        if (state.audio_id && window.allFiles.length > 0) {
-            const fileObj = window.allFiles.find(f => f.id === state.audio_id);
-            if (fileObj) {
-                if (miniSongTitle) miniSongTitle.innerText = fileObj.original_name;
-                const bigTitle = document.getElementById('nowPlaying');
-                if (bigTitle) bigTitle.innerText = fileObj.original_name;
-                const bigArtist = document.getElementById('nowPlayingArtist');
-                if (bigArtist) bigArtist.innerText = state.is_playing ? 'Playing...' : 'Paused';
-            }
-        } else {
-            const bigTitle = document.getElementById('nowPlaying');
-            if (bigTitle) bigTitle.innerText = 'Ready';
-            const bigArtist = document.getElementById('nowPlayingArtist');
-            if (bigArtist) bigArtist.innerText = 'Audio-Auto System';
-            if (miniSongTitle) miniSongTitle.innerText = 'Ready';
-        }
-
-        // Play/Pause icons
-        if (miniPlayIcon) {
-            miniPlayIcon.className = state.is_playing
-                ? "fas fa-pause-circle text-2xl md:text-3xl"
-                : "fas fa-play-circle text-2xl md:text-3xl";
-        }
-        const bigPlayIcon = document.getElementById('playIcon');
-        if (bigPlayIcon) {
-            bigPlayIcon.className = state.is_playing
-                ? "fas fa-pause-circle text-5xl md:text-6xl drop-shadow-md"
-                : "fas fa-play-circle text-5xl md:text-6xl drop-shadow-md";
-        }
-
-        // Playlist highlight
-        const currentItems = document.querySelectorAll('#playlistContainer > div');
-        currentItems.forEach(el => el.classList.remove('bg-blue-50', 'dark:bg-blue-900/20', 'border-l-4', 'border-primary'));
-        if (state.audio_id) {
-            const activeEl = document.querySelector(`#playlistContainer > div[data-id="${state.audio_id}"]`);
-            if (activeEl) activeEl.classList.add('bg-blue-50', 'dark:bg-blue-900/20', 'border-l-4', 'border-primary');
-        }
-
-        // Volume sliders (don't update while user is dragging)
-        if (state.volume !== undefined) {
-            const volSlider = document.getElementById('volSlider');
-            if (volSlider && document.activeElement !== volSlider) volSlider.value = state.volume;
-            if (miniVolSlider && document.activeElement !== miniVolSlider) miniVolSlider.value = state.volume;
-        }
-
-        // Mini player visibility
-        if (state.audio_id && location.pathname !== '/') {
-            if (bottomPlayer) bottomPlayer.classList.remove('hidden');
-        }
+    function _filenameToTitle(uri) {
+        const parts = uri.split('/');
+        return decodeURIComponent(parts[parts.length - 1] || '').replace(/\.[^.]+$/, '');
     }
 
-    // ─── API Commands & Modal Logic ───────────────────────────────────────────
-    let selectedDevices = new Set(['all']);
-
-    function getTargetDevice() {
-        if (selectedDevices.has('all')) return 'all';
-        return Array.from(selectedDevices).join(',');
+    function _matchUriToFile(uri) {
+        // Try to find local file whose filename appears in the URI
+        return window.allFiles.find(f => uri.includes(encodeURIComponent(f.filename)) || uri.includes(f.filename));
     }
 
-    window.openDeviceModal = function() {
-        const modal = document.getElementById('deviceModal');
-        const content = document.getElementById('deviceModalContent');
-        if (modal && content) {
-            modal.classList.remove('hidden');
-            modal.classList.add('flex');
-            setTimeout(() => {
-                content.classList.remove('scale-95', 'opacity-0');
-                content.classList.add('scale-100', 'opacity-100');
-            }, 10);
-        }
-        window.renderDeviceModalList();
-    };
-
-    window.closeDeviceModal = function() {
-        const modal = document.getElementById('deviceModal');
-        const content = document.getElementById('deviceModalContent');
-        if (modal && content) {
-            content.classList.remove('scale-100', 'opacity-100');
-            content.classList.add('scale-95', 'opacity-0');
-            setTimeout(() => {
-                modal.classList.add('hidden');
-                modal.classList.remove('flex');
-            }, 300);
-        }
-    };
-
-    window.selectAllDevices = function() {
-        selectedDevices.clear();
-        selectedDevices.add('all');
-        window.renderDeviceModalList();
-    };
-
-    window.deselectAllDevices = function() {
-        selectedDevices.clear();
-        window.renderDeviceModalList();
-    };
-
-    window.toggleDeviceSelection = function(devName) {
-        if (selectedDevices.has('all')) {
-            selectedDevices.clear();
-        }
-        if (selectedDevices.has(devName)) {
-            selectedDevices.delete(devName);
-        } else {
-            selectedDevices.add(devName);
-        }
-        if (selectedDevices.size === 0) {
-            selectedDevices.add('all');
-        }
-        window.renderDeviceModalList();
-    };
-
-    window.applyDeviceSelection = function() {
-        const text = document.getElementById('selectedDeviceText');
-        if (text) {
-            if (selectedDevices.has('all')) {
-                text.innerText = 'All Devices';
-            } else {
-                const arr = Array.from(selectedDevices);
-                if (arr.length === 1) text.innerText = arr[0];
-                else text.innerText = arr.length + ' Devices Selected';
-            }
-        }
-        window.closeDeviceModal();
-    };
-
-    window.renderDeviceModalList = function() {
-        const list = document.getElementById('deviceModalList');
-        if (!list) return;
-        fetch('/api/devices').then(r => r.json()).then(devices => {
-            devices = devices.filter(d => d.name !== 'Web App');
-            if (devices.length === 0) {
-                list.innerHTML = '<div class="text-center text-sm text-gray-500 py-4">No devices found.</div>';
-                return;
-            }
-            list.innerHTML = devices.map(d => {
-                const isSelected = selectedDevices.has('all') || selectedDevices.has(d.name);
-                const isOnline = d.status === 'online';
-                return `
-                    <div onclick="window.toggleDeviceSelection('${d.name}')" class="flex items-center justify-between p-3 rounded-lg border ${isSelected ? 'border-primary bg-blue-50 dark:bg-blue-900/20' : 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800'} cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
-                        <div class="flex items-center space-x-3">
-                            <div class="w-8 h-8 rounded-full ${isOnline ? 'bg-green-100 text-green-600 dark:bg-green-900/30 dark:text-green-400' : 'bg-red-100 text-red-600 dark:bg-red-900/30 dark:text-red-400'} flex items-center justify-center">
-                                <i class="fas fa-speaker"></i>
-                            </div>
-                            <div>
-                                <h4 class="font-semibold text-gray-800 dark:text-gray-200">${d.name}</h4>
-                                <p class="text-xs text-gray-500">${isOnline ? 'Online' : 'Offline'} • ${d.ip_address || 'N/A'}</p>
-                            </div>
-                        </div>
-                        <div class="text-primary">
-                            <i class="fas ${isSelected ? 'fa-check-circle text-lg' : 'fa-circle text-gray-300 dark:text-gray-600'}"></i>
-                        </div>
-                    </div>
-                `;
-            }).join('');
+    function _highlightPlaylist(fileId) {
+        document.querySelectorAll('#playlistContainer > div').forEach(el => {
+            el.classList.remove('bg-blue-50', 'dark:bg-blue-900/20', 'border-l-4', 'border-primary');
         });
-    };
-
-    function pushStateChange(action, payload) {
-        const formData = new FormData();
-        formData.append('device_name', getTargetDevice());
-        for (const [key, value] of Object.entries(payload)) {
-            formData.append(key, value);
-        }
-        return fetch('/api/' + action, { method: 'POST', body: formData });
+        const active = document.querySelector(`#playlistContainer > div[data-id="${fileId}"]`);
+        if (active) active.classList.add('bg-blue-50', 'dark:bg-blue-900/20', 'border-l-4', 'border-primary');
     }
 
-    window.selectSong = function (id) {
-        const fileObj = window.allFiles.find(f => f.id === id);
-        if (!fileObj) return;
+    // ─── API wrappers ──────────────────────────────────────────────────────────
+    async function maPost(path, fields) {
+        const fd = new FormData();
+        for (const [k, v] of Object.entries(fields)) fd.append(k, v);
+        const resp = await fetch('/api/ma/' + path, { method: 'POST', body: fd });
+        if (!resp.ok) {
+            const txt = await resp.text();
+            console.warn(`[MA] ${path} failed:`, txt);
+        }
+        return resp;
+    }
 
-        // Mark as loading BEFORE the server round-trip so applyServerState
-        // doesn't trigger a second wavesurfer.load() for the same song.
-        currentLoadedAudioId = id;
+    // Get the actual MA player_id (not display name)
+    function pid() { 
+        const selected = window.maState.selectedPlayerId;
+        const group = window.maState.groupPlayerId;
+        
+        // If selected player is in our players cache, return the actual MA player_id
+        if (selected && window.maState.players[selected]) {
+            return selected;
+        }
+        // If group player is in cache, return it
+        if (group && window.maState.players[group]) {
+            return group;
+        }
+        // Fallback - prefer actual player_id from cache over display names
+        const cachedIds = Object.keys(window.maState.players);
+        if (cachedIds.length > 0) {
+            // Prefer group player if available
+            const groupPlayer = cachedIds.find(id => window.maState.players[id]?.is_group);
+            if (groupPlayer) return groupPlayer;
+            return cachedIds[0];
+        }
+        // Last resort
+        return selected || group || 'ESP32-Sync';
+    }
 
-        const audioSrc = `/audio_files/${encodeURIComponent(fileObj.filename)}`;
-        // Let wavesurfer.load() drive the loading if available;
+    // ─── Playback controls ─────────────────────────────────────────────────────
+    window.selectSong = function(id) {
+        const file = window.allFiles.find(f => f.id === id);
+        if (!file) return;
+
+        // Load waveform visual
         if (wavesurfer) {
-            wavesurfer.load(audioSrc).catch(e => {
-                if (e.name !== 'AbortError') console.error(e);
+            currentLoadedFileId = id;
+            wavesurfer.load(`/audio_files/${encodeURIComponent(file.filename)}`).catch(e => {
+                if (e.name !== 'AbortError') console.warn(e);
             });
         }
+        _highlightPlaylist(id);
 
-        // Tell server to start playback via Sendspin (all clients receive audio via Sendspin)
-        const formData = new FormData();
-        formData.append('audio_id', id);
-        formData.append('volume', window.globalState.volume);
-        formData.append('position', 0);
-        fetch('/api/play', { method: 'POST', body: formData });
+        maPost('play', { player_id: pid(), audio_id: id });
     };
 
     function togglePlay() {
-        if (!window.globalState.audio_id) {
+        const player = getActivePlayer();
+        if (!player) {
+            // Nothing selected yet — play first file
             if (window.allFiles.length > 0) window.selectSong(window.allFiles[0].id);
             return;
         }
-        if (window.globalState.is_playing) {
-            pushStateChange('stop', {});
-        } else {
-            // Resume from current position
-            const pos = window.globalState.current_position || window.globalState.position;
-            pushStateChange('play', {
-                audio_id: window.globalState.audio_id,
-                volume: window.globalState.volume,
-                position: pos
-            });
-        }
+        maPost('play_pause', { player_id: pid() });
+    }
+
+    function stopPlayback() {
+        maPost('stop', { player_id: pid() });
+        if (wavesurfer) wavesurfer.seekTo(0);
     }
 
     function playNext() {
+        const player = getActivePlayer();
+        const media  = player && player.current_media;
+        if (media) {
+            // Try MA next command first
+            maPost('next', { player_id: pid() });
+            return;
+        }
+        // Fall back to local file list
         if (window.allFiles.length === 0) return;
-        let idx = window.allFiles.findIndex(f => f.id === window.globalState.audio_id);
+        let idx = window.allFiles.findIndex(f => _matchUriToFile(media?.uri || '') === f);
         idx = (idx + 1) % window.allFiles.length;
         window.selectSong(window.allFiles[idx].id);
     }
 
     function playPrev() {
+        const player = getActivePlayer();
+        const media  = player && player.current_media;
+        if (media) {
+            maPost('prev', { player_id: pid() });
+            return;
+        }
         if (window.allFiles.length === 0) return;
-        let idx = window.allFiles.findIndex(f => f.id === window.globalState.audio_id);
+        let idx = window.allFiles.findIndex(f => _matchUriToFile(media?.uri || '') === f);
         idx = (idx - 1 + window.allFiles.length) % window.allFiles.length;
         window.selectSong(window.allFiles[idx].id);
     }
 
-    function stopPlayback() {
-        if (!window.globalState.audio_id) return;
-        pushStateChange('stop', { clear: true });
+    function setVolume(vol) {
+        maPost('volume', { player_id: pid(), volume: Math.round(vol) });
     }
 
-    function toggleMute() {
-        const state = window.globalState;
-        if (state.volume > 0) {
-            state.previousVolume = state.volume;
-            pushStateChange('volume', { volume: 0 });
-        } else {
-            pushStateChange('volume', { volume: state.previousVolume || 50 });
+    function seekTo(position) {
+        maPost('seek', { player_id: pid(), position });
+    }
+
+    // ─── Device (player) selection ─────────────────────────────────────────────
+    window.openDeviceModal = function() {
+        const modal   = document.getElementById('deviceModal');
+        const content = document.getElementById('deviceModalContent');
+        if (!modal) return;
+        modal.classList.remove('hidden');
+        modal.classList.add('flex');
+        setTimeout(() => {
+            if (content) content.classList.remove('scale-95', 'opacity-0'), content.classList.add('scale-100', 'opacity-100');
+        }, 10);
+        window.renderDeviceModalList();
+    };
+
+    window.closeDeviceModal = function() {
+        const modal   = document.getElementById('deviceModal');
+        const content = document.getElementById('deviceModalContent');
+        if (!modal) return;
+        if (content) { content.classList.remove('scale-100', 'opacity-100'); content.classList.add('scale-95', 'opacity-0'); }
+        setTimeout(() => { modal.classList.add('hidden'); modal.classList.remove('flex'); }, 300);
+    };
+
+    window.renderDeviceModalList = function() {
+        const list = document.getElementById('deviceModalList');
+        if (!list) return;
+
+        fetch('/api/ma/players')
+            .then(r => r.json())
+            .then(players => {
+                // Find the group player
+                const groupPlayer = players.find(p => p.is_group && p.in_sync_group);
+                const groupMembers = groupPlayer ? players.filter(p => p.in_sync_group && !p.is_group) : [];
+                
+                // Build the list: Group at top, then individual members
+                let html = '';
+                
+                // Group player option
+                if (groupPlayer) {
+                    const selected = window.maState.selectedPlayerId === groupPlayer.player_id;
+                    const avail = groupPlayer.available;
+                    const state = groupPlayer.playback_state || 'idle';
+                    const stateIcons = { playing: '▶', paused: '⏸', idle: '■', unknown: '?' };
+                    html += `
+                        <div onclick="window.selectMAPlayer('${groupPlayer.player_id}')"
+                             class="flex items-center justify-between p-3 rounded-lg border ${selected ? 'border-primary bg-blue-50 dark:bg-blue-900/20' : 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800'} cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors mb-2">
+                            <div class="flex items-center gap-3">
+                                <div class="w-8 h-8 rounded-full flex items-center justify-center ${avail ? 'bg-blue-100 text-blue-600 dark:bg-blue-900/30 dark:text-blue-400' : 'bg-red-100 text-red-600 dark:bg-red-900/30 dark:text-red-400'}">
+                                    <i class="fas fa-layer-group text-xs"></i>
+                                </div>
+                                <div>
+                                    <h4 class="font-semibold text-sm text-gray-800 dark:text-gray-200">${groupPlayer.name} (Group)</h4>
+                                    <p class="text-xs text-gray-500">${avail ? stateIcons[state] + ' ' + state : 'Offline'} · All speakers</p>
+                                </div>
+                            </div>
+                            <i class="fas ${selected ? 'fa-check-circle text-primary text-lg' : 'fa-circle text-gray-300 dark:text-gray-600'}"></i>
+                        </div>
+                    `;
+                }
+                
+                // Individual player options
+                if (groupMembers.length > 0) {
+                    html += '<div class="text-xs text-gray-500 px-1 mb-1">Individual Speakers:</div>';
+                    html += groupMembers.map(p => {
+                        const selected = window.maState.selectedPlayerId === p.player_id;
+                        const avail = p.available;
+                        const state = p.playback_state || 'idle';
+                        const stateIcons = { playing: '▶', paused: '⏸', idle: '■', unknown: '?' };
+                        return `
+                            <div onclick="window.selectMAPlayer('${p.player_id}')"
+                                 class="flex items-center justify-between p-3 rounded-lg border ${selected ? 'border-primary bg-blue-50 dark:bg-blue-900/20' : 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800'} cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors mb-1">
+                                <div class="flex items-center gap-3">
+                                    <div class="w-8 h-8 rounded-full flex items-center justify-center ${avail ? 'bg-green-100 text-green-600 dark:bg-green-900/30 dark:text-green-400' : 'bg-red-100 text-red-600 dark:bg-red-900/30 dark:text-red-400'}">
+                                        <i class="fas fa-speaker text-xs"></i>
+                                    </div>
+                                    <div>
+                                        <h4 class="font-semibold text-sm text-gray-800 dark:text-gray-200">${p.name}</h4>
+                                        <p class="text-xs text-gray-500">${avail ? stateIcons[state] + ' ' + state : 'Offline'}</p>
+                                    </div>
+                                </div>
+                                <i class="fas ${selected ? 'fa-check-circle text-primary text-lg' : 'fa-circle text-gray-300 dark:text-gray-600'}"></i>
+                            </div>
+                        `;
+                    }).join('');
+                }
+                
+                if (!groupPlayer && groupMembers.length === 0) {
+                    list.innerHTML = '<div class="text-center text-sm text-gray-500 py-4">No ESP32-Sync players discovered yet.</div>';
+                    return;
+                }
+                
+                list.innerHTML = html;
+            })
+            .catch(() => {
+                list.innerHTML = '<div class="text-center text-sm text-red-500 py-4">Failed to load MA players.</div>';
+            });
+    };
+
+    window.selectMAPlayer = function(playerId) {
+        window.maState.selectedPlayerId = playerId;
+        const player = window.maState.players[playerId];
+        const text   = document.getElementById('selectedDeviceText');
+        if (text && player) text.textContent = player.name || playerId;
+        const infoSel = document.getElementById('infoSelectedPlayer');
+        if (infoSel) infoSel.textContent = (player && player.name) || playerId;
+        window.renderDeviceModalList();
+    };
+
+    window.applyDeviceSelection = function() {
+        window.closeDeviceModal();
+    };
+
+    window.setMAQueueMode = function(mode) {
+        // mode: 'off' | 'one' | 'all'
+        const qid = getSelectedPlayerId(); // queue_id == player_id in MA
+        const fd = new FormData();
+        fd.append('queue_id', qid);
+        fd.append('repeat_mode', mode);
+        fetch('/api/ma/repeat', { method: 'POST', body: fd });
+    };
+
+    // Stubs for 'Select All' / 'None' buttons in device modal (multi-select not used; just pick group)
+    window.selectAllDevices = function() {
+        const groupId = window.maState.groupPlayerId;
+        if (groupId) window.selectMAPlayer(groupId);
+    };
+    window.deselectAllDevices = function() { /* no-op in single-select mode */ };
+
+    // ─── Playlist rendering ────────────────────────────────────────────────────
+    function renderPlaylist(files) {
+        const container = document.getElementById('playlistContainer');
+        if (!container) return;
+        if (!files || files.length === 0) {
+            container.innerHTML = '<div class="p-8 text-center text-gray-500">No files uploaded yet. Click "Upload Music" to add files.</div>';
+            return;
         }
+        const activePlayer = getActivePlayer();
+        const activeUri    = activePlayer?.current_media?.uri || '';
+
+        container.innerHTML = files.map(f => {
+            const isActive = activeUri && (activeUri.includes(encodeURIComponent(f.filename)) || activeUri.includes(f.filename));
+            const dur      = f.duration_sec ? formatTime(f.duration_sec) : '?:??';
+            return `
+                <div data-id="${f.id}"
+                     class="flex items-center justify-between px-4 py-3 hover:bg-gray-50 dark:hover:bg-gray-800/50 cursor-pointer transition-colors gap-3 ${isActive ? 'bg-blue-50 dark:bg-blue-900/20 border-l-4 border-primary' : ''}"
+                     onclick="window.selectSong(${f.id})">
+                    <div class="flex items-center gap-3 min-w-0">
+                        <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500/20 to-purple-500/20 flex items-center justify-center shrink-0">
+                            <i class="fas fa-music text-blue-400 text-xs"></i>
+                        </div>
+                        <div class="min-w-0">
+                            <p class="font-medium text-gray-800 dark:text-gray-200 truncate text-sm">${f.original_name}</p>
+                            <p class="text-xs text-gray-500">${dur}</p>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-2 shrink-0">
+                        ${isActive ? '<i class="fas fa-volume-up text-primary text-sm"></i>' : ''}
+                        <button onclick="event.stopPropagation(); deleteFile(${f.id})"
+                                class="text-gray-300 hover:text-red-500 transition-colors p-1">
+                            <i class="fas fa-trash text-xs"></i>
+                        </button>
+                    </div>
+                </div>
+            `;
+        }).join('');
     }
 
-    // ─── WaveSurfer Initialization ────────────────────────────────────────────
+    window.deleteFile = function(id) {
+        Swal.fire({
+            title: 'Delete file?',
+            text: 'This will also remove any related schedules.',
+            icon: 'warning',
+            showCancelButton: true,
+            confirmButtonColor: '#ef4444',
+            confirmButtonText: 'Delete',
+        }).then(res => {
+            if (res.isConfirmed) {
+                fetch(`/api/files/${id}`, { method: 'DELETE' })
+                    .then(() => {
+                        window.allFiles = window.allFiles.filter(f => f.id !== id);
+                        renderPlaylist(window.allFiles);
+                    });
+            }
+        });
+    };
 
+    // ─── Upload Modal ──────────────────────────────────────────────────────────
+    window.openUploadModal = function() {
+        Swal.fire({
+            title: '<i class="fas fa-cloud-upload-alt mr-2 text-primary"></i>Upload Music',
+            html: `
+                <div class="text-left space-y-4">
+                    <div id="dropZone"
+                         class="border-2 border-dashed border-gray-300 dark:border-gray-600 rounded-xl p-8 text-center cursor-pointer hover:border-primary transition-colors"
+                         ondragover="event.preventDefault()" ondrop="handleFileDrop(event)">
+                        <i class="fas fa-music text-4xl text-gray-400 mb-3 block"></i>
+                        <p class="text-gray-600 dark:text-gray-400 text-sm">Drag & drop audio here or</p>
+                        <label class="mt-2 inline-block cursor-pointer text-primary font-semibold hover:underline text-sm">
+                            browse files
+                            <input type="file" id="uploadFileInput" accept=".mp3,.wav,.flac,.aac,.ogg" class="hidden" onchange="handleFileSelect(event)">
+                        </label>
+                        <p id="selectedFileName" class="text-xs text-gray-500 mt-2"></p>
+                    </div>
+                    <div id="uploadProgress" class="hidden">
+                        <div class="flex items-center gap-2 text-sm text-primary">
+                            <i class="fas fa-spinner fa-spin"></i>
+                            <span id="uploadProgressText">Uploading…</span>
+                        </div>
+                        <div class="w-full h-1 bg-gray-200 rounded-full mt-2">
+                            <div id="uploadProgressBar" class="h-1 bg-primary rounded-full transition-all" style="width:0%"></div>
+                        </div>
+                    </div>
+                </div>
+            `,
+            showConfirmButton: false,
+            showCloseButton: true,
+            customClass: { popup: 'glass' },
+        });
+
+        window._selectedFile = null;
+    };
+
+    window.handleFileDrop = function(event) {
+        event.preventDefault();
+        const file = event.dataTransfer.files[0];
+        if (file) _setUploadFile(file);
+    };
+
+    window.handleFileSelect = function(event) {
+        const file = event.target.files[0];
+        if (file) _setUploadFile(file);
+    };
+
+    function _setUploadFile(file) {
+        window._selectedFile = file;
+        const fn = document.getElementById('selectedFileName');
+        if (fn) fn.textContent = file.name;
+        // Auto-upload
+        _doUpload(file);
+    }
+
+    function _doUpload(file) {
+        const progress = document.getElementById('uploadProgress');
+        const bar      = document.getElementById('uploadProgressBar');
+        const txt      = document.getElementById('uploadProgressText');
+        if (progress) progress.classList.remove('hidden');
+        if (txt) txt.textContent = 'Uploading ' + file.name + '…';
+
+        const fd = new FormData();
+        fd.append('file', file);
+
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/upload');
+        xhr.upload.onprogress = e => {
+            if (e.lengthComputable && bar) {
+                bar.style.width = Math.round((e.loaded / e.total) * 100) + '%';
+            }
+        };
+        xhr.onload = () => {
+            Swal.close();
+            if (xhr.status === 200) {
+                Swal.fire({ toast: true, position: 'top-end', icon: 'success', title: 'Uploaded!', text: file.name, showConfirmButton: false, timer: 3000 });
+                fetch('/api/files').then(r => r.json()).then(files => {
+                    window.allFiles = files;
+                    renderPlaylist(files);
+                });
+            } else {
+                Swal.fire('Upload Failed', xhr.responseText, 'error');
+            }
+        };
+        xhr.onerror = () => Swal.fire('Upload Error', 'Network error during upload.', 'error');
+        xhr.send(fd);
+    }
+
+    // ─── WaveSurfer initialisation ─────────────────────────────────────────────
     function initWaveSurfer() {
         const container = document.getElementById('waveformContainer');
         if (!container) return;
-
-        // UI Update interval based on server state extrapolation
-        if (!window.sendspinPlayerUIInterval) {
-            window.sendspinPlayerUIInterval = setInterval(() => {
-                if (window.globalState && window.globalState.is_playing) {
-                    const elapsed = (Date.now() / 1000) - window.globalState.last_updated;
-                    let currentTime = window.globalState.position + (elapsed * (window.globalState.speed || 1.0));
-                    
-                    const dur = wavesurfer ? wavesurfer.getDuration() : 0;
-                    if (dur > 0 && currentTime > dur) currentTime = dur;
-
-                    // update wavesurfer UI visually without triggering its audio
-                    if (wavesurfer && dur > 0) {
-                        wavesurfer.seekTo(currentTime / dur);
-                    }
-
-                    const t = formatTime(currentTime);
-                    const timeElapsed = document.getElementById('timeElapsed');
-                    if (timeElapsed && timeElapsed.innerText !== t) timeElapsed.innerText = t;
-                    if (miniTimeElapsed && miniTimeElapsed.innerText !== t) miniTimeElapsed.innerText = t;
-
-                    if (dur > 0) {
-                        const pct = (currentTime / dur) * 100;
-                        if (miniProgressOverlay) miniProgressOverlay.style.width = pct + '%';
-                        const progressBar = document.getElementById('progressBar');
-                        if (progressBar) progressBar.style.width = pct + '%';
-                    }
-                }
-            }, 100);
-        }
-
-        if (typeof WaveSurfer === 'undefined') {
-            console.error("WaveSurfer not loaded!");
-            return;
-        }
+        if (typeof WaveSurfer === 'undefined') { console.error('WaveSurfer not loaded'); return; }
 
         container.innerHTML = '';
         container.appendChild(globalWaveformContainer);
 
-        if (wavesurferInitialized) {
-            _attachDashboardWaveSurferEvents();
-            return;
-        }
+        if (wavesurferInitialized) { _attachWaveSurferEvents(); return; }
         wavesurferInitialized = true;
 
         wavesurfer = WaveSurfer.create({
             container: globalWaveformContainer,
             waveColor: 'rgba(59, 130, 246, 0.4)',
             progressColor: 'rgba(59, 130, 246, 1)',
-            barWidth: 2,
-            barGap: 2,
-            barRadius: 2,
+            barWidth: 2, barGap: 2, barRadius: 2,
             height: 64,
             normalize: true,
-            interact: true
+            interact: true,
+            backend: 'WebAudio',
         });
 
         wavesurfer.on('interaction', () => {
-            if (window.globalState && window.globalState.audio_id) {
-                const newTime = wavesurfer.getCurrentTime();
-                pushStateChange('play', {
-                    audio_id: window.globalState.audio_id,
-                    volume: window.globalState.volume,
-                    position: newTime
-                });
-            }
+            const dur = wavesurfer.getDuration();
+            if (dur > 0) seekTo(wavesurfer.getCurrentTime());
         });
-
-        if (window.globalState.audio_id) {
-            const fileObj = window.allFiles.find(f => f.id === window.globalState.audio_id);
-            if (fileObj) {
-                wavesurfer.load(`/audio_files/${encodeURIComponent(fileObj.filename)}`).catch(e => {
-                    if (e.name !== 'AbortError') console.error(e);
-                });
-            }
-        }
 
         wavesurfer.on('ready', () => {
             const dur = wavesurfer.getDuration();
             const timeTotal = document.getElementById('timeTotal');
-            if (timeTotal) timeTotal.innerText = formatTime(dur);
-            if (miniTimeTotal) miniTimeTotal.innerText = formatTime(dur);
-
-            if (window.globalState.audio_id) {
-                const fileObj = window.allFiles.find(f => f.id === window.globalState.audio_id);
-                if (fileObj && (!fileObj.duration_sec || fileObj.duration_sec === 0)) {
-                    fileObj.duration_sec = dur;
-                    const el = document.querySelector(`#playlistContainer > div[data-id="${fileObj.id}"] p`);
-                    if (el) el.innerText = formatTime(dur);
-                }
-            }
+            if (timeTotal) timeTotal.textContent = formatTime(dur);
+            if (miniTimeTotal) miniTimeTotal.textContent = formatTime(dur);
         });
 
-
-        _attachDashboardWaveSurferEvents();
+        _attachWaveSurferEvents();
     }
 
-    function _attachDashboardWaveSurferEvents() {
-        if (!wavesurfer) return;
-        // Since interact is false, the user can't click to seek on the waveform directly.
-        // If we want to allow seeking, we'd enable interact and handle the 'interaction' event.
-        // For now, seeking is handled by pushing state manually.
-        
-        if (wavesurfer.getDuration && wavesurfer.getDuration() > 0) {
-            const dur = wavesurfer.getDuration();
-            const timeTotal = document.getElementById('timeTotal');
-            if (timeTotal) timeTotal.innerText = formatTime(dur);
-            if (miniTimeTotal) miniTimeTotal.innerText = formatTime(dur);
+    function _attachWaveSurferEvents() {
+        // Progress bar container seek
+        const pb = document.getElementById('miniProgressBarContainer');
+        if (pb && !pb._seekAttached) {
+            pb._seekAttached = true;
+            pb.addEventListener('click', e => {
+                const rect = pb.getBoundingClientRect();
+                const pct  = (e.clientX - rect.left) / rect.width;
+                const player = getActivePlayer();
+                const dur = player?.current_media?.duration || 0;
+                if (dur > 0) seekTo(pct * dur);
+            });
         }
     }
 
-    // ─── Page Scripts ─────────────────────────────────────────────────────────
-    window.initPageScripts = function (url) {
-        if (url === '/' || url === '') initDashboard();
-        else if (url === '/devices') initDevices();
-        else if (url === '/scheduler') initScheduler();
-        else if (url === '/config') initConfig();
-    };
-
-    let syncChart = null;
-    let syncInterval = null;
-
-    function initSyncChart() {
-        const ctx = document.getElementById('sendspin-demo-sync-graph');
-        if (!ctx) return;
-        
-        if (syncChart) syncChart.destroy();
-        
-        syncChart = new Chart(ctx, {
-            type: 'line',
-            data: {
-                labels: [],
-                datasets: []
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                animation: { duration: 0 },
-                scales: {
-                    x: { display: false },
-                    y: { 
-                        title: { display: true, text: 'Offset (ms)' },
-                        grid: { color: 'rgba(156, 163, 175, 0.2)' }
-                    }
-                },
-                plugins: {
-                    legend: { position: 'top', labels: { color: '#9ca3af' } }
-                }
-            }
-        });
-    }
-
-    function updateSyncData() {
-        if (window.location.pathname !== '/' && window.location.pathname !== '') return;
-        
-        fetch('/api/sendspin/clients').then(r => r.json()).then(clients => {
-            const viz = document.getElementById('timingVizContainer');
-            if (viz) {
-                if (clients.length === 0) {
-                    viz.innerHTML = '<div class="text-sm text-gray-500 text-center py-4">Waiting for device data...</div>';
-                } else {
-                    viz.innerHTML = clients.map(c => {
-                        const rttMs = (c.last_rtt_us / 1000).toFixed(1);
-                        const offsetMs = (c.sync_offset_us / 1000).toFixed(2);
-                        const syncCount = c.sync_count || 0;
-                        const rttColor = c.last_rtt_us < 5000 ? 'text-green-500' : c.last_rtt_us < 20000 ? 'text-yellow-500' : 'text-red-500';
-                        const offsetColor = Math.abs(c.sync_offset_us) < 1000 ? 'text-green-500' : Math.abs(c.sync_offset_us) < 5000 ? 'text-yellow-500' : 'text-red-500';
-                        return `
-                            <div class="flex justify-between items-center p-2 rounded bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700">
-                                <div class="flex items-center space-x-2">
-                                    <i class="fas fa-microchip text-primary"></i>
-                                    <span class="font-medium">${c.name || c.id}</span>
-                                </div>
-                                <div class="flex space-x-4 text-xs font-mono">
-                                    <span class="${rttColor}" title="Round Trip Time"><i class="fas fa-exchange-alt mr-1"></i>${rttMs}ms RTT</span>
-                                    <span class="${offsetColor}" title="Sync Offset"><i class="fas fa-clock mr-1"></i>${offsetMs}ms offset</span>
-                                    <span class="text-blue-500" title="Sync Count"><i class="fas fa-sync mr-1"></i>${syncCount} syncs</span>
-                                </div>
-                            </div>
-                        `;
-                    }).join('');
-                }
-            }
-
-            if (syncChart) {
-                const now = new Date().toLocaleTimeString();
-                syncChart.data.labels.push(now);
-                if (syncChart.data.labels.length > 30) syncChart.data.labels.shift();
-
-                clients.forEach((c, i) => {
-                    let ds = syncChart.data.datasets.find(d => d.label === (c.name || c.id));
-                    if (!ds) {
-                        const colors = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6'];
-                        ds = {
-                            label: c.name || c.id,
-                            data: Array(syncChart.data.labels.length - 1).fill(null),
-                            borderColor: colors[i % colors.length],
-                            borderWidth: 2,
-                            tension: 0.4,
-                            pointRadius: 2,
-                            pointBackgroundColor: colors[i % colors.length],
-                        };
-                        syncChart.data.datasets.push(ds);
-                    }
-                    // Plot real sync offset in milliseconds
-                    const offsetMs = c.sync_offset_us ? (c.sync_offset_us / 1000) : 0;
-                    ds.data.push(offsetMs);
-                    if (ds.data.length > 30) ds.data.shift();
-                });
-
-                syncChart.update();
-            }
-        }).catch(e => console.error("Sync data error:", e));
-    }
-
+    // ─── Dashboard page init ───────────────────────────────────────────────────
     function initDashboard() {
-        initWaveSurfer();
-        initSyncChart();
-        if (syncInterval) clearInterval(syncInterval);
-        syncInterval = setInterval(updateSyncData, 1000);
+        // Load files
+        fetch('/api/files').then(r => r.json()).then(files => {
+            window.allFiles = files;
+            renderPlaylist(files);
+        });
 
-        // Bind player controls
+        // Init WaveSurfer
+        initWaveSurfer();
+
+        // Load MA players snapshot
+        fetch('/api/ma/players').then(r => r.json()).then(players => {
+            players.forEach(p => { window.maState.players[p.player_id] = p; });
+            _resolveGroupPlayer();
+            updateUIFromMA();
+
+            // Set default device text
+            const pid_ = window.maState.groupPlayerId;
+            const gp   = pid_ ? window.maState.players[pid_] : null;
+            const txt  = document.getElementById('selectedDeviceText');
+            if (txt && gp) txt.textContent = gp.name;
+        });
+
+        // Bind big player controls
         const btnPlay = document.getElementById('btnPlay');
         if (btnPlay) btnPlay.addEventListener('click', togglePlay);
         const btnStop = document.getElementById('btnStop');
@@ -779,731 +852,475 @@ document.addEventListener('DOMContentLoaded', () => {
         const btnPrev = document.getElementById('btnPrev');
         if (btnPrev) btnPrev.addEventListener('click', playPrev);
 
-        const volIcon = document.getElementById('volIcon');
-        if (volIcon) volIcon.addEventListener('click', toggleMute);
-
+        // Volume slider
         const volSlider = document.getElementById('volSlider');
         if (volSlider) {
-            volSlider.value = window.globalState.volume;
-            volSlider.addEventListener('input', e => {
-                if (window.sendspinPlayer && typeof window.sendspinPlayer.setVolume === 'function') {
-                    window.sendspinPlayer.setVolume(e.target.value / 100.0);
-                }
-            });
-            volSlider.addEventListener('change', e => {
-                pushStateChange('volume', { volume: e.target.value });
+            const player = getActivePlayer();
+            if (player) volSlider.value = player.group_volume ?? player.volume_level ?? 50;
+            volSlider.addEventListener('change', e => setVolume(e.target.value));
+        }
+
+        // Volume icon mute
+        const volIcon = document.getElementById('volIcon');
+        if (volIcon) {
+            volIcon.addEventListener('click', () => {
+                const player = getActivePlayer();
+                const vol    = player?.group_volume ?? player?.volume_level ?? 50;
+                setVolume(vol > 0 ? 0 : 50);
             });
         }
 
-        
-        // ─── Codec Selector ───────────────────────────────────────────────────────
-        // Ensure updateGlobalCodec is defined at global scope BEFORE any page loads
-        window.updateGlobalCodec = function() {
-            try {
-                const codecSelect = document.getElementById('codecSelect');
-                if (!codecSelect) {
-                    console.error('CodecSelect element not found');
+        // Search
+        const search = document.getElementById('searchInput');
+        if (search) {
+            search.addEventListener('input', e => {
+                const q = e.target.value.toLowerCase();
+                renderPlaylist(window.allFiles.filter(f => f.original_name.toLowerCase().includes(q)));
+            });
+        }
+    }
+
+    // ─── Devices page ──────────────────────────────────────────────────────────
+    function initDevices() {
+        function loadMAPlayers() {
+            fetch('/api/ma/players').then(r => r.json()).then(players => {
+                players.forEach(p => { window.maState.players[p.player_id] = p; });
+                const grid = document.getElementById('maPlayerGrid');
+                if (!grid) return;
+                const syncPlayers = players.filter(p => p.in_sync_group || p.is_group);
+                if (syncPlayers.length === 0) {
+                    grid.innerHTML = '<div class="col-span-3 text-center text-gray-500 py-12"><i class="fas fa-wifi-slash text-4xl mb-3 block"></i>No ESP32-Sync players discovered yet.</div>';
                     return;
                 }
-                const val = codecSelect.value;
-                console.log('Updating codec to:', val);
-                fetch('/api/settings', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ codec: val })
-                })
-                .then(r => {
-                    if (!r.ok) throw new Error('HTTP ' + r.status);
-                    return r.json();
-                })
-                .then(res => {
-                    if (res.status === 'ok') {
-                        console.log('Codec successfully updated to', val);
-                    } else {
-                        console.error('Codec update failed:', res);
-                    }
-                })
-                .catch(e => console.error("Codec update error:", e));
-            } catch (err) {
-                console.error("updateGlobalCodec exception:", err);
-            }
-        };
-
-        // Load current codec setting on page init
-        const codecSelect = document.getElementById('codecSelect');
-        if (codecSelect) {
-            fetch('/api/settings')
-                .then(r => r.json())
-                .then(settings => {
-                    codecSelect.value = settings.codec || 'pcm';
-                    console.log('Loaded codec setting:', settings.codec);
-                })
-                .catch(e => console.error("Settings fetch error:", e));
-        }
-
-        // No longer load devices into a <select>
-        // We use Device Modal instead.
-
-        // Load file list
-        fetch('/api/files').then(r => r.json()).then(files => {
-            window.allFiles = files;
-            window.renderPlaylist(files);
-            updateUIFromState();
-        });
-
-        const searchInput = document.getElementById('searchInput');
-        if (searchInput) {
-            searchInput.addEventListener('input', e => {
-                const q = e.target.value.toLowerCase();
-                const filtered = window.allFiles.filter(f => f.original_name.toLowerCase().includes(q));
-                window.renderPlaylist(filtered);
+                grid.innerHTML = syncPlayers.map(p => {
+                    const state  = p.playback_state || 'idle';
+                    const vol    = p.group_volume ?? p.volume_level ?? 0;
+                    const avail  = p.available;
+                    const stateColors = { playing: 'green', paused: 'yellow', idle: 'gray', unknown: 'gray' };
+                    const c      = stateColors[state] || 'gray';
+                    const media  = p.current_media;
+                    return `
+                        <div class="glass rounded-2xl p-5 shadow-xl border border-white/10">
+                            <div class="flex items-center justify-between mb-4">
+                                <div class="flex items-center gap-3">
+                                    <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500/30 to-purple-500/30 flex items-center justify-center">
+                                        <i class="fas ${p.is_group ? 'fa-layer-group' : 'fa-speaker'} text-blue-400"></i>
+                                    </div>
+                                    <div>
+                                        <h3 class="font-bold text-gray-900 dark:text-white">${p.name}</h3>
+                                        <p class="text-xs text-gray-500">${p.player_id}</p>
+                                    </div>
+                                </div>
+                                <span class="px-2 py-1 rounded-full text-xs font-medium ${avail ? `bg-${c}-100 dark:bg-${c}-900/30 text-${c}-700 dark:text-${c}-300` : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'}">
+                                    ${avail ? state : 'offline'}
+                                </span>
+                            </div>
+                            ${media ? `<div class="text-sm text-gray-600 dark:text-gray-400 truncate mb-3"><i class="fas fa-music mr-1 text-primary"></i>${media.title || 'Playing…'}</div>` : ''}
+                            <div class="flex items-center gap-2 mt-2">
+                                <i class="fas fa-volume-up text-gray-400 text-xs"></i>
+                                <div class="flex-1 h-1.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+                                    <div class="h-full bg-primary rounded-full transition-all" style="width:${vol}%"></div>
+                                </div>
+                                <span class="text-xs text-gray-500 font-mono w-8">${vol}%</span>
+                            </div>
+                            <div class="flex gap-2 mt-4">
+                                <button onclick="maDevCmd('play_pause','${p.player_id}')" class="flex-1 py-1.5 rounded-lg bg-primary/10 hover:bg-primary/20 text-primary text-xs font-medium transition-colors"><i class="fas fa-play mr-1"></i>Play/Pause</button>
+                                <button onclick="maDevCmd('stop','${p.player_id}')" class="flex-1 py-1.5 rounded-lg bg-red-100 dark:bg-red-900/20 hover:bg-red-200 text-red-600 text-xs font-medium transition-colors"><i class="fas fa-stop mr-1"></i>Stop</button>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
             });
         }
 
-        const playlistContainer = document.getElementById('playlistContainer');
-        window.renderPlaylist = function(files) {
-            if (!playlistContainer) return;
-            if (files.length === 0) {
-                playlistContainer.innerHTML = '<div class="p-8 text-center text-gray-500">No audio files.</div>';
+        window.maDevCmd = function(cmd, playerId) {
+            const fd = new FormData();
+            fd.append('player_id', playerId);
+            fetch('/api/ma/' + cmd, { method: 'POST', body: fd })
+                .then(() => setTimeout(loadMAPlayers, 500));
+        };
+
+        loadMAPlayers();
+        const ri = setInterval(loadMAPlayers, 5000);
+        window._devicesRefreshInterval = ri;
+    }
+
+    // ─── Scheduler page ────────────────────────────────────────────────────────
+    function initScheduler() {
+        loadSchedules();
+        initCalendar();
+
+        const form = document.getElementById('schedulerForm');
+        if (form) {
+            form.addEventListener('submit', e => {
+                e.preventDefault();
+                submitSchedule();
+            });
+        }
+        loadSchedulerDevices();
+    }
+
+    // ─── Global scheduler functions (accessible from HTML onclick) ─────────────
+    window.setSchedRepeat = function(mode) {
+        const repeatSelect = document.getElementById('repeatSelect');
+        if (repeatSelect) repeatSelect.value = mode;
+        // Update button styles
+        ['none', 'daily', 'weekly', 'monthly'].forEach(m => {
+            const btn = document.getElementById('btnRepeat_' + m);
+            if (btn) {
+                if (m === mode) {
+                    btn.className = 'flex-1 py-1.5 rounded-full text-xs font-medium bg-primary text-white';
+                } else {
+                    btn.className = 'flex-1 py-1.5 rounded-full text-xs font-medium bg-gray-700 text-gray-300 hover:bg-gray-600';
+                }
+            }
+        });
+    };
+
+    function loadSchedulerDevices() {
+        const container = document.getElementById('targetDeviceContainer');
+        if (!container) return;
+        fetch('/api/ma/players').then(r => r.json()).then(players => {
+            const groupPlayer = players.find(p => p.is_group && p.in_sync_group);
+            const groupMembers = groupPlayer ? players.filter(p => p.in_sync_group && !p.is_group) : [];
+            
+            let html = '';
+            
+            // Group option
+            if (groupPlayer) {
+                html += `
+                    <label class="flex items-center space-x-3 cursor-pointer p-2 hover:bg-gray-200 dark:hover:bg-gray-800 rounded mb-2 border ${groupPlayer.available ? 'border-green-200 dark:border-green-800' : 'border-gray-300'}">
+                        <input type="radio" name="targetDevice" value="${groupPlayer.player_id}" class="text-primary h-4 w-4" checked>
+                        <i class="fas fa-layer-group text-blue-500"></i>
+                        <span class="text-sm text-gray-900 dark:text-gray-200 font-medium">${groupPlayer.name} (Group)</span>
+                        <span class="text-xs text-gray-500">All speakers</span>
+                    </label>`;
+            }
+            
+            // Individual speakers section
+            if (groupMembers.length > 0) {
+                html += '<div class="text-xs text-gray-500 px-1 mb-1 mt-2">Individual Speakers:</div>';
+                html += groupMembers.map(p => `
+                    <label class="flex items-center space-x-3 cursor-pointer p-2 hover:bg-gray-200 dark:hover:bg-gray-800 rounded mb-1 ${p.available ? '' : 'opacity-50'}">
+                        <input type="radio" name="targetDevice" value="${p.player_id}" class="text-primary h-4 w-4">
+                        <i class="fas fa-volume-up text-gray-400"></i>
+                        <span class="text-sm text-gray-900 dark:text-gray-200">${p.name}</span>
+                    </label>`).join('');
+            }
+            
+            // Fallback if no players found
+            if (!groupPlayer && groupMembers.length === 0) {
+                html = `
+                    <label class="flex items-center space-x-3 cursor-pointer p-1 hover:bg-gray-200 dark:hover:bg-gray-800 rounded">
+                        <input type="radio" name="targetDevice" value="all" class="text-primary h-4 w-4" checked>
+                        <span class="text-sm text-gray-900 dark:text-gray-200 font-medium">All ESP32-Sync (Group)</span>
+                    </label>
+                    <p class="text-xs text-gray-500 mt-2 px-1">Individual players will appear here when discovered...</p>`;
+            }
+            
+            container.innerHTML = html;
+        }).catch(() => {
+            container.innerHTML = `
+                <label class="flex items-center space-x-3 cursor-pointer p-1 hover:bg-gray-200 dark:hover:bg-gray-800 rounded">
+                    <input type="radio" name="targetDevice" value="all" class="text-primary h-4 w-4" checked>
+                    <span class="text-sm text-gray-900 dark:text-gray-200 font-medium">All ESP32-Sync (Group)</span>
+                </label>`;
+        });
+    }
+
+    function loadSchedules() {
+        fetch('/api/schedules').then(r => r.json()).then(schedules => {
+            const tbody = document.getElementById('scheduleTableBody');
+            if (!tbody) return;
+            if (schedules.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="py-4 text-center text-gray-500">No schedules yet.</td></tr>';
                 return;
             }
-            playlistContainer.innerHTML = files.map(f => `
-                <div class="flex items-center justify-between px-6 py-4 hover:bg-gray-50 dark:hover:bg-[#253246] transition-colors group cursor-pointer" data-id="${f.id}">
-                    <div class="flex items-center space-x-4" onclick="window.selectSong(${f.id})">
-                        <div class="h-10 w-10 rounded-full bg-blue-100 dark:bg-blue-900/30 flex items-center justify-center text-primary group-hover:scale-110 transition-transform">
-                            <i class="fas fa-music"></i>
-                        </div>
-                        <div>
-                            <h4 class="font-semibold text-gray-800 dark:text-gray-200">${f.original_name}</h4>
-                            <p class="text-xs text-gray-500 mt-1">${formatTime(f.duration_sec || 0)}</p>
-                        </div>
-                    </div>
-                    <div class="flex items-center space-x-3">
-                        <button onclick="window.deleteFile(${f.id})" class="text-red-400 hover:text-red-600 p-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                            <i class="fas fa-trash"></i>
-                        </button>
-                    </div>
-                </div>
-            `).join('');
-
-            updateUIFromState();
-        }
-
-        window.deleteFile = function (id) {
-            Swal.fire({
-                title: 'Delete file?', icon: 'warning', showCancelButton: true, confirmButtonText: 'Yes, delete it'
-            }).then(res => {
-                if (res.isConfirmed) {
-                    if (window.globalState && window.globalState.audio_id === id) {
-                        pushStateChange('stop', { clear: true });
-                    }
-                    fetch('/api/files/' + id, { method: 'DELETE' }).then(() => {
-                        fetch('/api/files').then(r => r.json()).then(files => {
-                            window.allFiles = files;
-                            window.renderPlaylist(files);
-                        });
-                    });
-                }
-            });
-        };
-    }
-
-    function initDevices() {
-        const grid = document.getElementById('deviceGrid');
-        if (!grid) return;
-
-        function renderDevices() {
-            fetch('/api/devices').then(r => r.json()).then(devices => {
-                devices = devices.filter(d => d.name !== 'Web App');
-                if (devices.length === 0) {
-                    grid.innerHTML = '<div class="col-span-full text-center py-10 text-gray-500">No devices registered.</div>';
-                    return;
-                }
-                devices.forEach(d => {
-                    let card = document.getElementById('card-' + d.name);
-                    const isOnline = d.status === 'online';
-                    if (!card) {
-                        card = document.createElement('div');
-                        card.id = 'card-' + d.name;
-                        grid.appendChild(card);
-                    }
-                    card.className = `glass rounded-2xl p-6 shadow-lg flex flex-col h-96 transition-all duration-300 ${!isOnline ? 'opacity-50 grayscale' : ''}`;
-                    const logs = window.globalState.deviceLogs && window.globalState.deviceLogs[d.name] 
-                        ? window.globalState.deviceLogs[d.name].map(l => `<div>${l}</div>`).join('') 
-                        : '<div>--- Terminal Logs ---</div>';
-                        
-                    // Format date to DD-MMMM-YYYY hh:mm:ss
-                    let dateStr = 'N/A';
-                    if (d.last_seen) {
-                        const dObj = new Date(d.last_seen);
-                        if (!isNaN(dObj.getTime())) {
-                            const day = String(dObj.getDate()).padStart(2, '0');
-                            const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
-                            const month = months[dObj.getMonth()];
-                            const year = dObj.getFullYear();
-                            const hrs = String(dObj.getHours()).padStart(2, '0');
-                            const mins = String(dObj.getMinutes()).padStart(2, '0');
-                            const secs = String(dObj.getSeconds()).padStart(2, '0');
-                            dateStr = `${day}-${month}-${year} ${hrs}:${mins}:${secs}`;
-                        }
-                    }
-
-                    card.innerHTML = `
-                        <div class="flex justify-between items-start mb-2 shrink-0">
-                            <h3 class="text-lg font-bold flex items-center"><i class="fas fa-microchip text-primary mr-2"></i> ${d.name}</h3>
-                            <span class="flex items-center text-xs px-2 py-1 rounded-full ${isOnline ? 'bg-green-900/30 text-green-400' : 'bg-red-900/30 text-red-400'}">
-                                ${(d.status || 'offline').toUpperCase()}
-                            </span>
-                        </div>
-                        <div class="text-xs text-gray-400 mb-2 space-y-1">
-                            <div><i class="fas fa-network-wired w-4"></i> IP: ${d.ip_address || 'N/A'}</div>
-                            <div><i class="fas fa-wifi w-4"></i> Signal: ${d.rssi ? d.rssi + ' dBm' : 'N/A'}</div>
-                            <div><i class="fas fa-thermometer-half w-4"></i> Temp: ${d.temperature ? d.temperature + '°C' : 'N/A'}</div>
-                            <div><i class="fas fa-clock w-4"></i> Last seen: ${dateStr}</div>
-                        </div>
-                        <div class="relative flex-1 mt-1 rounded bg-black overflow-hidden flex flex-col">
-                            <div class="absolute top-2 right-4 flex space-x-4 bg-black/60 px-2 py-1 rounded z-10">
-                                <button class="text-gray-400 hover:text-white transition group relative" onclick="toggleAutoScroll('${d.name}')">
-                                    <i id="icon-scroll-${d.name}" class="fas ${(!window.globalState.autoScroll || window.globalState.autoScroll[d.name] !== false) ? 'fa-lock' : 'fa-unlock'}"></i>
-                                    <div class="absolute top-full right-0 mt-2 px-3 py-1.5 text-xs glass rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-20 text-gray-800 dark:text-gray-200 font-sans font-semibold">Toggle Auto-scroll</div>
-                                </button>
-                                <button class="text-gray-400 hover:text-white transition group relative" onclick="clearLogs('${d.name}')">
-                                    <i class="fas fa-trash"></i>
-                                    <div class="absolute top-full right-0 mt-2 px-3 py-1.5 text-xs glass rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-20 text-gray-800 dark:text-gray-200 font-sans font-semibold">Clear Logs</div>
-                                </button>
-                                <button class="text-gray-400 hover:text-white transition group relative" onclick="copyLogs('${d.name}')">
-                                    <i class="fas fa-copy"></i>
-                                    <div class="absolute top-full right-0 mt-2 px-3 py-1.5 text-xs glass rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-20 text-gray-800 dark:text-gray-200 font-sans font-semibold">Copy to Clipboard</div>
-                                </button>
-                            </div>
-                            <div class="flex-1 text-green-400 font-mono text-[11px] leading-relaxed p-3 overflow-y-auto" id="term-${d.name}">${logs}</div>
-                        </div>
-                    `;
-                });
-            });
-        }
-
-        renderDevices();
-        if (window.deviceInterval) clearInterval(window.deviceInterval);
-        window.deviceInterval = setInterval(renderDevices, 5000);
-
-        // Listen for MQTT log messages
-        window.addEventListener('deviceLog', (e) => {
-            const { device, text } = e.detail;
-            const term = document.getElementById('term-' + device);
-            if (term) {
-                const line = document.createElement('div');
-                line.textContent = `[${new Date().toLocaleTimeString()}] ${text}`;
-                term.appendChild(line);
-                if (!window.globalState.autoScroll || window.globalState.autoScroll[device] !== false) {
-                    term.scrollTop = term.scrollHeight;
-                }
-            }
-        });
-    }
-
-    function initScheduler() {
-        const calendarEl = document.getElementById('calendar');
-        if (!calendarEl) return;
-
-        const calendar = new FullCalendar.Calendar(calendarEl, {
-            initialView: 'dayGridMonth',
-            headerToolbar: {
-                left: 'prev,next today',
-                center: 'title',
-                right: 'dayGridMonth,timeGridWeek,timeGridDay'
-            },
-            height: 'auto',
-            dateClick: function (info) {
-                window.openScheduleModal(info.dateStr, null);
-            },
-            eventClick: function (info) {
-                window.openScheduleModal(info.event.startStr.split('T')[0], parseInt(info.event.id));
-            }
-        });
-
-        calendar.render();
-
-        function fetchSchedules() {
-            fetch('/api/schedules').then(r => r.json()).then(data => {
-                calendar.removeAllEvents();
-                data.forEach(s => {
-                    const d = new Date(s.play_time);
-                    let eventParams = {
-                        id: s.id,
-                        title: `${s.audio_name} → ${s.device_name}`,
-                        backgroundColor: s.repeat !== 'none' ? '#7c3aed' : '#3b82f6'
-                    };
-                    if (s.repeat === 'weekly') {
-                        eventParams.daysOfWeek = [d.getDay()];
-                        eventParams.startTime = d.toTimeString().split(' ')[0];
-                    } else if (s.repeat === 'daily') {
-                        eventParams.startTime = d.toTimeString().split(' ')[0];
-                    } else {
-                        eventParams.start = d;
-                    }
-                    calendar.addEvent(eventParams);
-                });
-
-                const tbody = document.getElementById('scheduleTableBody');
-                if (tbody) {
-                    if (data.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="5" class="py-4 text-center text-gray-500">No active schedules</td></tr>';
-                        return;
-                    }
-                    tbody.innerHTML = data.map(s => `
-                        <tr class="border-b dark:border-gray-700/50 hover:bg-gray-50 dark:hover:bg-gray-800/30">
-                            <td class="py-3 px-4 font-mono text-primary text-xs">${new Date(s.play_time).toLocaleString()}</td>
-                            <td class="py-3 px-4 text-sm">${s.audio_name || 'Unknown'}</td>
-                            <td class="py-3 px-4 text-sm">${s.device_name}</td>
-                            <td class="py-3 px-4 capitalize text-sm"><span class="px-2 py-1 rounded-full text-xs ${s.repeat !== 'none' ? 'bg-purple-900/30 text-purple-400' : 'bg-blue-900/30 text-blue-400'}">${s.repeat}</span></td>
-                            <td class="py-3 px-4 text-right">
-                                <button onclick="window.deleteSchedule(${s.id})" class="text-red-400 hover:text-red-600 transition-colors px-2 py-1">
-                                    <i class="fas fa-trash-alt"></i>
-                                </button>
-                            </td>
-                        </tr>
-                    `).join('');
-                }
-            });
-        }
-        fetchSchedules();
-
-        const modal = document.getElementById('scheduleModal');
-        const form = document.getElementById('schedulerForm');
-
-        // Populate audio select
-        fetch('/api/files').then(r => r.json()).then(files => {
-            const select = document.getElementById('audioSelect');
-            if (select) {
-                if (files.length === 0) {
-                    select.innerHTML = '<option value="">-- No audio files uploaded --</option>';
-                } else {
-                    select.innerHTML = files.map(f => `<option value="${f.id}">${f.original_name}</option>`).join('');
-                }
-            }
-        });
-
-        // Populate device select
-        fetch('/api/devices').then(r => r.json()).then(devices => {
-            const container = document.getElementById('targetDeviceContainer');
-            if (container) {
-                let html = `
-                    <label class="flex items-center space-x-3 cursor-pointer p-1 hover:bg-gray-200 dark:hover:bg-gray-800 rounded">
-                        <input type="radio" name="targetDevice" value="all" class="text-primary focus:ring-primary h-4 w-4 cursor-pointer" checked>
-                        <span class="text-sm text-gray-900 dark:text-gray-200 font-medium">All Devices</span>
-                    </label>
+            tbody.innerHTML = schedules.map(s => {
+                const dt = new Date(s.play_time);
+                const dtStr = dt.toLocaleString();
+                return `
+                    <tr class="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/30 transition-colors">
+                        <td class="py-3 px-4 text-sm">${dtStr}</td>
+                        <td class="py-3 px-4 text-sm font-medium truncate max-w-[200px]">${s.audio_name}</td>
+                        <td class="py-3 px-4 text-sm text-gray-500">${s.device_name}</td>
+                        <td class="py-3 px-4"><span class="px-2 py-1 text-xs rounded-full ${s.repeat !== 'none' ? 'bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300' : 'bg-gray-100 dark:bg-gray-800 text-gray-500'}">${s.repeat}</span></td>
+                        <td class="py-3 px-4 text-right">
+                            <button onclick="window.openScheduleModal(${s.id}, ${JSON.stringify(s).replace(/"/g, '&quot;')})" class="text-primary hover:text-blue-700 text-xs font-medium mr-2"><i class="fas fa-edit"></i></button>
+                            <button onclick="deleteSchedule(${s.id})" class="text-red-400 hover:text-red-600 text-xs font-medium"><i class="fas fa-trash"></i></button>
+                        </td>
+                    </tr>
                 `;
-                devices.filter(d => d.name !== 'Web App').forEach(d => {
-                    html += `
-                        <label class="flex items-center space-x-3 cursor-pointer p-1 hover:bg-gray-200 dark:hover:bg-gray-800 rounded">
-                            <input type="radio" name="targetDevice" value="${d.name}" class="text-primary focus:ring-primary h-4 w-4 cursor-pointer">
-                            <span class="text-sm text-gray-900 dark:text-gray-200 font-medium">${d.name}</span>
-                        </label>
-                    `;
-                });
-                container.innerHTML = html;
-            }
+            }).join('');
+        });
+    }
+
+    window.openScheduleModal = function(id, data) {
+        const modal    = document.getElementById('scheduleModal');
+        const titleEl  = document.getElementById('modalTitle');
+        const editIdEl = document.getElementById('editingScheduleId');
+        if (!modal) return;
+
+        // Load audio files into select
+        fetch('/api/files').then(r => r.json()).then(files => {
+            window.allFiles = files;
+            const sel = document.getElementById('audioSelect');
+            if (sel) sel.innerHTML = files.map(f => `<option value="${f.id}">${f.original_name}</option>`).join('');
         });
 
-        window.openScheduleModal = function (dateStr, existingId) {
-            if (form) form.reset();
-            // Reset repeat buttons
-            if (typeof setSchedRepeat === 'function') setSchedRepeat('none');
-            if (dateStr && document.getElementById('dateSelect')) {
-                document.getElementById('dateSelect').value = dateStr;
+        loadSchedulerDevices();
+
+        if (id && data) {
+            if (titleEl) titleEl.textContent = 'Edit Schedule';
+            if (editIdEl) editIdEl.value = id;
+            // Pre-fill form
+            const dt = new Date(data.play_time);
+            const dateEl = document.getElementById('dateSelect');
+            const timeEl = document.getElementById('timeSelect');
+            const timeDisplay = document.getElementById('timeDisplay');
+            if (dateEl) dateEl.value = dt.toISOString().slice(0, 10);
+            if (timeEl) {
+                const t = dt.toTimeString().slice(0, 8);
+                timeEl.value = t;
+                if (timeDisplay) timeDisplay.textContent = t;
             }
-            if (document.getElementById('timeSelect')) {
-                document.getElementById('timeSelect').value = '12:00:00';
-            }
-            if (document.getElementById('scheduleVolumeSelect')) {
-                document.getElementById('scheduleVolumeSelect').value = 70;
-                const volVal = document.getElementById('schedVolVal');
-                if (volVal) volVal.textContent = '70';
-            }
-            if (modal) modal.classList.remove('hidden');
+            const volEl  = document.getElementById('scheduleVolumeSelect');
+            const volVal = document.getElementById('schedVolVal');
+            if (volEl)  volEl.value = data.volume;
+            if (volVal) volVal.textContent = data.volume;
+            if (typeof window.setSchedRepeat === 'function') window.setSchedRepeat(data.repeat || 'none');
+        } else {
+            if (titleEl) titleEl.textContent = 'Add Schedule';
+            if (editIdEl) editIdEl.value = '';
+            // Default date = today
+            const dateEl = document.getElementById('dateSelect');
+            if (dateEl) dateEl.value = new Date().toISOString().slice(0, 10);
+        }
+
+        modal.classList.remove('hidden');
+        modal.classList.add('flex');
+    };
+
+    window.closeScheduleModal = function() {
+        const modal = document.getElementById('scheduleModal');
+        if (modal) { modal.classList.add('hidden'); modal.classList.remove('flex'); }
+    };
+
+    function submitSchedule() {
+        const editingId  = document.getElementById('editingScheduleId')?.value;
+        const date       = document.getElementById('dateSelect')?.value;
+        const time       = document.getElementById('timeSelect')?.value || '12:00:00';
+        const audioId    = document.getElementById('audioSelect')?.value;
+        const volume     = document.getElementById('scheduleVolumeSelect')?.value || 70;
+        const repeat     = document.getElementById('repeatSelect')?.value || 'none';
+        const deviceName = document.querySelector('input[name="targetDevice"]:checked')?.value || 'all';
+
+        if (!date || !audioId) {
+            Swal.fire({ toast: true, position: 'top-end', icon: 'warning', title: 'Please fill all fields', showConfirmButton: false, timer: 2000 });
+            return;
+        }
+
+        const payload = {
+            device_name: deviceName,
+            audio_id:    parseInt(audioId),
+            play_time:   `${date}T${time}`,
+            repeat:      repeat,
+            volume:      parseInt(volume),
         };
 
-        window.closeScheduleModal = function () {
-            if (modal) modal.classList.add('hidden');
-        };
+        const url    = editingId ? `/api/schedules/${editingId}` : '/api/schedules';
+        const method = editingId ? 'PUT' : 'POST';
 
-        if (form) {
-            form.addEventListener('submit', async (e) => {
-                e.preventDefault();
-                const d = document.getElementById('dateSelect').value;
-                const t = document.getElementById('timeSelect').value;
-                if (!d || !t) {
-                    Swal.fire('Error', 'Please select date and time', 'error');
-                    return;
+        fetch(url, {
+            method,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        }).then(r => r.json()).then(() => {
+            window.closeScheduleModal();
+            loadSchedules();
+            Swal.fire({ toast: true, position: 'top-end', icon: 'success', title: editingId ? 'Schedule updated' : 'Schedule added', showConfirmButton: false, timer: 2000 });
+        }).catch(() => Swal.fire('Error', 'Failed to save schedule', 'error'));
+    }
+
+    window.deleteSchedule = function(id) {
+        Swal.fire({ title: 'Delete schedule?', icon: 'warning', showCancelButton: true, confirmButtonColor: '#ef4444', confirmButtonText: 'Delete' })
+            .then(r => {
+                if (r.isConfirmed) {
+                    fetch(`/api/schedules/${id}`, { method: 'DELETE' }).then(() => loadSchedules());
                 }
+            });
+    };
 
-                // Ensure seconds are present: HH:MM or HH:MM:SS → always HH:MM:SS
-                const parts = t.split(':');
-                const timeStr = parts.length >= 3 ? `${parts[0]}:${parts[1]}:${parts[2]}` : `${parts[0]}:${parts[1] || '00'}:00`;
-                // Build a LOCAL datetime string (no Z, no UTC offset).
-                // The server's APScheduler is configured with Asia/Jayapura timezone,
-                // so it correctly interprets naive strings as local time.
-                // Using .toISOString() would shift to UTC and schedule 9h early.
-                const pad = n => String(n).padStart(2,'0');
-                const localStr = `${d}T${timeStr}`;
-                const dt = new Date(`${d}T${timeStr}`);
-
-                const audioId = document.getElementById('audioSelect')?.value;
-                if (!audioId) {
-                    Swal.fire('Error', 'Please upload an audio file first', 'error');
-                    return;
-                }
-
-                const payload = {
-                    audio_id: parseInt(audioId),
-                    device_name: document.querySelector('input[name="targetDevice"]:checked')?.value || 'all',
-                    play_time: localStr,
-                    repeat: document.getElementById('repeatSelect')?.value || 'none',
-                    volume: parseInt(document.getElementById('scheduleVolumeSelect')?.value || 70)
-                };
-
-                try {
-                    const r = await fetch('/api/schedules', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload)
+    function initCalendar() {
+        const calEl = document.getElementById('calendar');
+        if (!calEl || typeof FullCalendar === 'undefined') return;
+        const cal = new FullCalendar.Calendar(calEl, {
+            initialView: 'dayGridMonth',
+            headerToolbar: { left: 'prev,next today', center: 'title', right: 'dayGridMonth,listWeek' },
+            events(info, success) {
+                fetch('/api/schedules').then(r => r.json()).then(scheds => {
+                    const events = scheds.map(s => {
+                        const baseEvent = {
+                            id:    s.id,
+                            title: `${s.audio_name} (${s.repeat})`,
+                            start: s.play_time,
+                            color: s.repeat === 'weekly' ? '#8b5cf6' : (s.repeat === 'monthly' ? '#f59e0b' : '#3b82f6'),
+                            extendedProps: { repeat: s.repeat, schedule: s }
+                        };
+                        
+                        // For recurring schedules, set up recurrence via rrule
+                        const rruleDays = ['su', 'mo', 'tu', 'we', 'th', 'fr', 'sa'];
+                        if (s.repeat === 'daily') {
+                            baseEvent.rrule = {
+                                freq: 'daily',
+                                dtstart: s.play_time
+                            };
+                        } else if (s.repeat === 'weekly') {
+                            const dt = new Date(s.play_time);
+                            baseEvent.rrule = {
+                                freq: 'weekly',
+                                byweekday: [ rruleDays[dt.getDay()] ],
+                                dtstart: s.play_time
+                            };
+                        } else if (s.repeat === 'monthly') {
+                            baseEvent.rrule = {
+                                freq: 'monthly',
+                                dtstart: s.play_time
+                            };
+                        }
+                        return baseEvent;
                     });
-                    if (r.ok) {
-                        Swal.fire({ toast: true, position: 'top-end', icon: 'success', title: 'Schedule saved!', showConfirmButton: false, timer: 3000 });
-                        window.closeScheduleModal();
-                        fetchSchedules();
-                    } else {
-                        const err = await r.json();
-                        Swal.fire('Error', err.detail || 'Failed to schedule', 'error');
-                    }
-                } catch (e) {
-                    console.error(e);
-                    Swal.fire('Error', 'Network error', 'error');
-                }
-            });
-        }
-
-        window.deleteSchedule = function (id) {
-            Swal.fire({
-                title: 'Delete schedule?', icon: 'warning', showCancelButton: true, confirmButtonText: 'Yes, delete'
-            }).then(res => {
-                if (res.isConfirmed) {
-                    fetch('/api/schedules/' + id, { method: 'DELETE' }).then(() => fetchSchedules());
-                }
-            });
-        };
+                    success(events);
+                });
+            },
+            eventClick: info => window.openScheduleModal(info.event.id, null),
+            dateClick: info => {
+                // Open schedule modal with clicked date pre-filled
+                window.openScheduleModal(null, null);
+                // Set the date after modal opens
+                setTimeout(() => {
+                    const dateEl = document.getElementById('dateSelect');
+                    if (dateEl) dateEl.value = info.dateStr;
+                }, 100);
+            },
+            eventContent: function(arg) {
+                const repeat = arg.event.extendedProps?.repeat || 'none';
+                const icons = {
+                    'none': 'fa-calendar',
+                    'daily': 'fa-calendar-day',
+                    'weekly': 'fa-calendar-week',
+                    'monthly': 'fa-calendar-alt'
+                };
+                const icon = icons[repeat] || 'fa-calendar';
+                return { html: `<div class="flex items-center gap-1"><i class="fas ${icon} mr-1"></i>${arg.event.title}</div>` };
+            },
+        });
+        cal.render();
+        // Store calendar instance for date click handling
+        window._calendarInstance = cal;
     }
 
+    // ─── Config page ───────────────────────────────────────────────────────────
     function initConfig() {
-        const form = document.getElementById('configForm');
-        if (!form) return;
-
-        // Dynamic formats based on type
-        const tcType = document.getElementById('cfgTcType');
-        const tcFormat = document.getElementById('cfgTcFormat');
-        const tcBitrate = document.getElementById('cfgTcBitrate');
-        
-        function updateTcOptions() {
-            if (!tcType || !tcFormat || !tcBitrate) return;
-            const isLossy = tcType.value === 'lossy';
-            tcFormat.innerHTML = isLossy 
-                ? '<option value="mp3">MP3</option><option value="aac">AAC</option><option value="ogg">OGG</option>'
-                : '<option value="flac">FLAC</option><option value="wav">WAV</option>';
-            tcBitrate.innerHTML = isLossy
-                ? '<option value="64k">64 kbps</option><option value="128k">128 kbps</option><option value="192k">192 kbps</option><option value="256k">256 kbps</option><option value="320k">320 kbps</option>'
-                : '<option value="16bit">16-bit</option><option value="24bit">24-bit</option>';
-        }
-
-        if (tcType) {
-            tcType.addEventListener('change', updateTcOptions);
-        }
-
-        const tcEnable = document.getElementById('cfgTcEnable');
-        const tcOptions = document.getElementById('cfgTcOptions');
-        if (tcEnable) {
-            tcEnable.addEventListener('change', (e) => {
-                if (e.target.checked) tcOptions.classList.remove('hidden');
-                else tcOptions.classList.add('hidden');
-            });
-        }
-
         fetch('/api/config').then(r => r.json()).then(conf => {
-            const elVol = document.getElementById('cfgVol');
-            const elTz = document.getElementById('cfgTz');
-            const elLang = document.getElementById('cfgLang');
+            if (!conf) return;
+            const vol = document.getElementById('cfgVol');
+            const volVal = document.getElementById('cfgVolVal');
+            if (vol) { vol.value = conf.default_volume || 50; }
+            if (volVal) volVal.textContent = (conf.default_volume || 50) + '%';
+            if (vol) vol.addEventListener('input', e => { if (volVal) volVal.textContent = e.target.value + '%'; });
 
-            if (elVol) {
-                elVol.value = conf.default_volume || 50;
-                const elVolVal = document.getElementById('cfgVolVal');
-                if (elVolVal) elVolVal.innerText = elVol.value + '%';
-            }
-            if (elTz) elTz.value = conf.timezone || 'Asia/Jayapura';
-            if (elLang) elLang.value = conf.language || 'en';
-            
+            const tz = document.getElementById('cfgTz');
+            if (tz) tz.value = conf.timezone || 'Asia/Jayapura';
+            const lang = document.getElementById('cfgLang');
+            if (lang) lang.value = conf.language || 'en';
+
+            const tcEnable = document.getElementById('cfgTcEnable');
+            const tcOpts   = document.getElementById('cfgTcOptions');
             if (tcEnable) {
-                tcEnable.checked = conf.transcode_enabled || false;
-                if (conf.transcode_enabled) tcOptions.classList.remove('hidden');
-                
-                if (tcType) tcType.value = conf.transcode_type || 'lossy';
-                updateTcOptions();
-                if (tcFormat) tcFormat.value = conf.transcode_format || 'mp3';
-                if (tcBitrate) tcBitrate.value = conf.transcode_bitrate || '128k';
-                
-                const tcSampleRate = document.getElementById('cfgTcSampleRate');
-                if (tcSampleRate) tcSampleRate.value = conf.transcode_samplerate || '44100';
+                tcEnable.checked = conf.transcode_enabled;
+                if (tcOpts) tcOpts.classList.toggle('hidden', !conf.transcode_enabled);
+                tcEnable.addEventListener('change', e => {
+                    if (tcOpts) tcOpts.classList.toggle('hidden', !e.target.checked);
+                    updateTranscodeFormats();
+                });
             }
+            const tcType = document.getElementById('cfgTcType');
+            if (tcType) {
+                tcType.value = conf.transcode_type || 'lossy';
+                tcType.addEventListener('change', updateTranscodeFormats);
+            }
+            const tcFmt  = document.getElementById('cfgTcFormat');
+            const tcBit  = document.getElementById('cfgTcBitrate');
+            const tcRate = document.getElementById('cfgTcSampleRate');
+            if (tcRate) tcRate.value = conf.transcode_samplerate || '44100';
+
+            function updateTranscodeFormats() {
+                const type = document.getElementById('cfgTcType')?.value;
+                if (tcFmt) {
+                    if (type === 'lossy') {
+                        tcFmt.innerHTML = '<option value="mp3">MP3</option><option value="aac">AAC</option><option value="ogg">OGG Vorbis</option>';
+                        if (tcBit) tcBit.innerHTML = '<option value="64k">64 kbps</option><option value="96k">96 kbps</option><option value="128k" selected>128 kbps</option><option value="192k">192 kbps</option><option value="320k">320 kbps</option>';
+                    } else {
+                        tcFmt.innerHTML = '<option value="flac">FLAC</option><option value="wav">WAV</option>';
+                        if (tcBit) tcBit.innerHTML = '<option value="16bit">16-bit</option><option value="24bit">24-bit</option>';
+                    }
+                    tcFmt.value = conf.transcode_format || (type === 'lossy' ? 'mp3' : 'flac');
+                    if (tcBit) tcBit.value = conf.transcode_bitrate || (type === 'lossy' ? '128k' : '16bit');
+                }
+            }
+            updateTranscodeFormats();
         });
 
-        const elVol = document.getElementById('cfgVol');
-        if (elVol) {
-            elVol.addEventListener('input', e => {
-                const elVolVal = document.getElementById('cfgVolVal');
-                if (elVolVal) elVolVal.innerText = e.target.value + '%';
+        const form = document.getElementById('configForm');
+        if (form) {
+            form.addEventListener('submit', async e => {
+                e.preventDefault();
+                const fd = new FormData(form);
+                const tcEnable = document.getElementById('cfgTcEnable');
+                fd.set('transcode_enabled', tcEnable?.checked ? 'true' : 'false');
+                await fetch('/api/config', { method: 'POST', body: fd });
+                Swal.fire({ toast: true, position: 'top-end', icon: 'success', title: 'Settings saved', showConfirmButton: false, timer: 2000 });
             });
         }
 
-        form.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const formData = new FormData();
-            formData.append('default_volume', document.getElementById('cfgVol')?.value || 50);
-            formData.append('timezone', document.getElementById('cfgTz')?.value || 'Asia/Jayapura');
-            formData.append('language', document.getElementById('cfgLang')?.value || 'en');
-            
-            if (tcEnable) {
-                formData.append('transcode_enabled', tcEnable.checked);
-                formData.append('transcode_type', tcType.value);
-                formData.append('transcode_format', tcFormat.value);
-                formData.append('transcode_bitrate', tcBitrate.value);
-                formData.append('transcode_samplerate', document.getElementById('cfgTcSampleRate').value);
-            }
-
-            try {
-                const r = await fetch('/api/config', { method: 'POST', body: formData });
-                if (r.ok) {
-                    Swal.fire({ toast: true, position: 'top-end', icon: 'success', title: 'Configuration Saved', showConfirmButton: false, timer: 3000 });
-                } else {
-                    Swal.fire('Error', 'Failed to save config', 'error');
-                }
-            } catch (e) {
-                console.error(e);
-            }
-        });
+        // MA status in config page
+        fetch('/api/ma/status').then(r => r.json()).then(st => {
+            const maUrl   = document.getElementById('cfgMaUrl');
+            const maGroup = document.getElementById('cfgMaGroup');
+            const maConn  = document.getElementById('cfgMaConn');
+            if (maUrl)   maUrl.textContent   = st.ma_url;
+            if (maGroup) maGroup.textContent  = st.group_player_name + (st.group_player_id ? ` (${st.group_player_id})` : '');
+            if (maConn)  maConn.innerHTML     = st.connected
+                ? '<span class="text-green-500"><i class="fas fa-check-circle mr-1"></i>Connected</span>'
+                : '<span class="text-red-400"><i class="fas fa-times-circle mr-1"></i>Disconnected</span>';
+        }).catch(() => {});
     }
 
-    // ─── Mini Player Controls ─────────────────────────────────────────────────
+    // ─── Page dispatcher ───────────────────────────────────────────────────────
+    window.initPageScripts = function(url) {
+        // Clean up devices refresh interval on nav away
+        if (window._devicesRefreshInterval && url !== '/devices') {
+            clearInterval(window._devicesRefreshInterval);
+            window._devicesRefreshInterval = null;
+        }
+        if (url === '/' || url === '') initDashboard();
+        else if (url === '/devices')   initDevices();
+        else if (url === '/scheduler') initScheduler();
+        else if (url === '/config')    initConfig();
+    };
+
+    // ─── Mini player bindings ──────────────────────────────────────────────────
     if (miniBtnPlay) miniBtnPlay.addEventListener('click', togglePlay);
-    const miniBtnStop = document.getElementById('miniBtnStop');
-    if (miniBtnStop) miniBtnStop.addEventListener('click', stopPlayback);
     if (miniBtnNext) miniBtnNext.addEventListener('click', playNext);
     if (miniBtnPrev) miniBtnPrev.addEventListener('click', playPrev);
 
-    const miniVolIcon = document.getElementById('miniVolIcon');
-    if (miniVolIcon) miniVolIcon.addEventListener('click', toggleMute);
-
     if (miniVolSlider) {
-        miniVolSlider.addEventListener('input', e => {
-            if (window.sendspinPlayer && typeof window.sendspinPlayer.setVolume === 'function') {
-                window.sendspinPlayer.setVolume(e.target.value / 100.0);
-            }
-        });
-        miniVolSlider.addEventListener('change', e => {
-            pushStateChange('volume', { volume: parseInt(e.target.value) });
-        });
+        miniVolSlider.addEventListener('change', e => setVolume(e.target.value));
     }
 
-    // ─── Terminal Controls ────────────────────────────────────────────────────
-    window.toggleAutoScroll = function(device) {
-        if (!window.globalState.autoScroll) window.globalState.autoScroll = {};
-        window.globalState.autoScroll[device] = window.globalState.autoScroll[device] === false ? true : false;
-        const icon = document.getElementById('icon-scroll-' + device);
-        if (icon) {
-            icon.className = window.globalState.autoScroll[device] ? 'fas fa-lock' : 'fas fa-unlock';
-        }
-    };
-
-    window.clearLogs = function(device) {
-        if (window.globalState.deviceLogs && window.globalState.deviceLogs[device]) {
-            window.globalState.deviceLogs[device] = [];
-        }
-        const term = document.getElementById('term-' + device);
-        if (term) term.innerHTML = '<div>--- Terminal Logs ---</div>';
-    };
-
-    window.copyLogs = function(device) {
-        const term = document.getElementById('term-' + device);
-        if (term) {
-            const text = term.innerText;
-            if (navigator.clipboard && navigator.clipboard.writeText) {
-                navigator.clipboard.writeText(text).then(showCopyToast);
-            } else {
-                // Fallback for non-HTTPS (like local IP)
-                const textArea = document.createElement("textarea");
-                textArea.value = text;
-                textArea.style.position = "fixed";  // Avoid scrolling to bottom
-                document.body.appendChild(textArea);
-                textArea.focus();
-                textArea.select();
-                try {
-                    document.execCommand('copy');
-                    showCopyToast();
-                } catch (err) {
-                    console.error('Fallback: Oops, unable to copy', err);
-                }
-                document.body.removeChild(textArea);
-            }
-        }
-    };
-    
-    function showCopyToast() {
-        Swal.fire({
-            toast: true,
-            position: 'top-end',
-            icon: 'success',
-            title: 'Logs copied to clipboard!',
-            showConfirmButton: false,
-            timer: 2000,
-            customClass: { popup: 'glass' },
-            background: 'transparent'
-        });
-    }
-
-    // ─── Modal Upload ──────────────────────────────────────────────────────────
-    window.openUploadModal = function() {
-        Swal.fire({
-            title: 'Upload Music',
-            html: `
-                <div id="dropZone" class="border-2 border-dashed border-gray-300 dark:border-gray-600 rounded-xl p-8 mb-4 text-center cursor-pointer hover:border-primary transition-colors bg-white/50 dark:bg-black/30">
-                    <i class="fas fa-cloud-upload-alt text-4xl text-primary mb-2"></i>
-                    <p class="text-sm text-gray-600 dark:text-gray-400">Drag & drop audio files here<br>or click to browse</p>
-                    <p class="text-xs text-gray-500 mt-2">Supported: mp3, wav, flac, aac, ogg</p>
-                    <input type="file" id="swalFileInput" multiple class="hidden">
-                </div>
-                <div id="swalUploadStatus" class="hidden">
-                    <div class="w-full bg-gray-200 rounded-full h-2.5 dark:bg-gray-700 mb-2">
-                        <div class="bg-primary h-2.5 rounded-full w-0 transition-all duration-300" id="swalUploadBar"></div>
-                    </div>
-                    <p class="text-xs text-center text-primary" id="swalUploadText">Uploading 0 of 0...</p>
-                </div>
-            `,
-            showConfirmButton: false,
-            showCancelButton: true,
-            cancelButtonText: 'Close',
-            customClass: { popup: 'glass' },
-            didOpen: () => {
-                const dropZone = document.getElementById('dropZone');
-                const fileInput = document.getElementById('swalFileInput');
-                const uploadStatus = document.getElementById('swalUploadStatus');
-                const uploadBar = document.getElementById('swalUploadBar');
-                const uploadText = document.getElementById('swalUploadText');
-
-                dropZone.addEventListener('click', () => fileInput.click());
-
-                ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
-                    dropZone.addEventListener(eventName, preventDefaults, false);
-                });
-
-                function preventDefaults(e) { e.preventDefault(); e.stopPropagation(); }
-
-                ['dragenter', 'dragover'].forEach(eventName => {
-                    dropZone.addEventListener(eventName, () => dropZone.classList.add('border-primary', 'bg-primary/10'), false);
-                });
-
-                ['dragleave', 'drop'].forEach(eventName => {
-                    dropZone.addEventListener(eventName, () => dropZone.classList.remove('border-primary', 'bg-primary/10'), false);
-                });
-
-                dropZone.addEventListener('drop', (e) => handleFiles(e.dataTransfer.files), false);
-                fileInput.addEventListener('change', (e) => handleFiles(e.target.files), false);
-
-                async function handleFiles(files) {
-                    if (!files || files.length === 0) return;
-                    
-                    dropZone.classList.add('hidden');
-                    uploadStatus.classList.remove('hidden');
-                    
-                    let uploadedCount = 0;
-                    
-                    for (let i = 0; i < files.length; i++) {
-                        const file = files[i];
-                        uploadText.innerText = `Uploading ${i + 1} of ${files.length}: ${file.name}`;
-                        const formData = new FormData();
-                        formData.append('file', file);
-                        
-                        try {
-                            const res = await fetch('/api/upload', { method: 'POST', body: formData });
-                            if (res.ok) {
-                                uploadedCount++;
-                                uploadBar.style.width = `${((i + 1) / files.length) * 100}%`;
-                            }
-                        } catch (err) {
-                            console.error('Upload failed for', file.name, err);
-                        }
-                    }
-                    
-                    uploadText.innerText = 'Refreshing playlist...';
-                    const newFiles = await (await fetch('/api/files')).json();
-                    window.allFiles = newFiles;
-                    renderPlaylist(newFiles);
-                    updateUIFromState();
-                    
-                    Swal.close();
-                }
-            }
-        });
-    };
-
-    if (miniProgressBarContainer) {
-        miniProgressBarContainer.addEventListener('click', (e) => {
-            const rect = miniProgressBarContainer.getBoundingClientRect();
-            const pct = (e.clientX - rect.left) / rect.width;
-            if (wavesurfer && wavesurfer.getDuration && wavesurfer.getDuration() > 0) {
-                const time = pct * wavesurfer.getDuration();
-                if (window.globalState.is_playing) {
-                    pushStateChange('seek', { position: time });
-                } else {
-                    pushStateChange('play', {
-                        audio_id: window.globalState.audio_id,
-                        volume: window.globalState.volume,
-                        position: time
-                    });
-                }
-            }
-        });
-    }
-
-    // ─── Bootstrap ───────────────────────────────────────────────────────────
-    // Load all files first so they're available when state arrives
-    fetch('/api/files').then(r => r.json()).then(files => {
-        window.allFiles = files;
-        // If state arrived before files finished loading, re-apply it now!
-        if (window.globalState && window.globalState.audio_id) {
-            applyServerState(window.globalState);
-        }
-    });
-
+    // ─── Kick off ─────────────────────────────────────────────────────────────
     connectWebSocket();
-    // Also poll the state once on load (WebSocket also sends state on connect)
-    fetch('/api/state').then(r => r.json()).then(state => {
-        applyServerState(state);
-    });
+    window.initPageScripts(location.pathname);
 
-    initPageScripts(location.pathname);
-    updatePlayerVisibility(location.pathname);
-});
-
-// ─── Global Helpers (must be outside DOMContentLoaded for onclick= to work) ──
-// The scheduler's repeat buttons use onclick="setSchedRepeat('daily')" which
-// is called from HTML context — must be a window-level function.
-window.setSchedRepeat = function(val) {
-    const hidden = document.getElementById('repeatSelect');
-    if (hidden) hidden.value = val;
-    ['none', 'daily', 'weekly', 'monthly'].forEach(v => {
-        const btn = document.getElementById('btnRepeat_' + v);
-        if (btn) {
-            btn.className = v === val
-                ? 'flex-1 py-1.5 rounded-full text-xs font-medium bg-primary text-white'
-                : 'flex-1 py-1.5 rounded-full text-xs font-medium bg-gray-700 text-gray-300 hover:bg-gray-600';
-        }
-    });
-};
+});  // DOMContentLoaded

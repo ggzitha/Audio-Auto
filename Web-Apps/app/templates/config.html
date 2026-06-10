@@ -92,26 +92,42 @@
     </div>
 
     <div class="glass rounded-2xl p-6 shadow-xl">
-        <h3 class="text-xl font-semibold mb-6 flex items-center border-b border-gray-200 dark:border-gray-700 pb-3" data-i18n="env_vars">
-            <i class="fas fa-server text-primary mr-3"></i> Environment Variables
+        <h3 class="text-xl font-semibold mb-6 flex items-center border-b border-gray-200 dark:border-gray-700 pb-3">
+            <i class="fas fa-music text-green-400 mr-3"></i> Music Assistant
         </h3>
-        <div class="space-y-4">
+        <div class="space-y-3">
             <div class="flex flex-col md:flex-row md:justify-between border-b border-gray-100 dark:border-gray-800 pb-2">
-                <span class="font-medium text-gray-700 dark:text-gray-300">MQTT Broker</span>
-                <span class="font-mono text-primary">192.168.88.8:1883</span>
+                <span class="font-medium text-gray-700 dark:text-gray-300">MA Server URL</span>
+                <span class="font-mono text-primary text-sm" id="cfgMaUrl">—</span>
             </div>
             <div class="flex flex-col md:flex-row md:justify-between border-b border-gray-100 dark:border-gray-800 pb-2">
-                <span class="font-medium text-gray-700 dark:text-gray-300">MQTT User</span>
-                <span class="font-mono text-primary">inskal</span>
+                <span class="font-medium text-gray-700 dark:text-gray-300">Group Player</span>
+                <span class="font-mono text-primary text-sm" id="cfgMaGroup">—</span>
+            </div>
+            <div class="flex flex-col md:flex-row md:justify-between border-b border-gray-100 dark:border-gray-800 pb-2">
+                <span class="font-medium text-gray-700 dark:text-gray-300">Connection</span>
+                <span class="text-sm" id="cfgMaConn"><span class="text-gray-400">Checking…</span></span>
             </div>
             <div class="flex flex-col md:flex-row md:justify-between pb-2">
                 <span class="font-medium text-gray-700 dark:text-gray-300">Database</span>
-                <span class="font-mono text-primary">MariaDB (audioauto)</span>
+                <span class="font-mono text-primary text-sm">MariaDB (audioauto)</span>
             </div>
         </div>
-        <div class="mt-8 p-4 bg-yellow-50 dark:bg-yellow-900/20 border-l-4 border-yellow-400 rounded">
-            <p class="text-sm text-yellow-800 dark:text-yellow-200">
-                <i class="fas fa-info-circle mr-1"></i> These settings are configured via <code>docker-compose.yml</code>. To update them, modify the compose file and recreate the containers.
+
+        <!-- Live MA Players Status -->
+        <div class="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700">
+            <h4 class="font-semibold text-gray-700 dark:text-gray-300 mb-3 flex items-center gap-2">
+                <i class="fas fa-broadcast-tower text-blue-400 text-sm"></i> ESP32-Sync Players
+            </h4>
+            <div id="maStatusPanel" class="space-y-2 text-sm">
+                <div class="text-center text-gray-400 py-4 text-sm">Loading players…</div>
+            </div>
+        </div>
+
+        <div class="mt-6 p-4 bg-blue-50 dark:bg-blue-900/20 border-l-4 border-blue-400 rounded">
+            <p class="text-sm text-blue-800 dark:text-blue-200">
+                <i class="fas fa-info-circle mr-1"></i> MA settings are configured via <code>docker-compose.yml</code>
+                (<code>MA_URL</code>, <code>MA_TOKEN</code>, <code>MA_GROUP_PLAYER</code>).
             </p>
         </div>
     </div>

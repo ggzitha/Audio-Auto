@@ -1,6 +1,27 @@
 version: '3.8'
 
+# Volume shared between MA and web-app containers.
+
 services:
+
+  # ── Music Assistant Server ──────────────────────────────────────────────────
+  music-assistant-server:
+    image: ghcr.io/music-assistant/server:latest
+    container_name: music-assistant-server
+    restart: unless-stopped
+    network_mode: host          # Required for mDNS/UPnP ESP32 discovery
+    volumes:
+      - /mnt/Main_Storage/Docker_NFS/Docker_VE/501_Music_Asist/data:/data
+      - /mnt/Main_Storage/Docker_NFS/Docker_VE/501_Music_Asist/media:/media
+    cap_add:
+      - SYS_ADMIN
+      - DAC_READ_SEARCH
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      - LOG_LEVEL=info
+
+  # ── MariaDB ─────────────────────────────────────────────────────────────────
   db:
     image: mariadb:10.11
     restart: always
@@ -12,9 +33,6 @@ services:
       TZ: Asia/Jayapura
     volumes:
       - ./dbs_data:/var/lib/mysql
-    # If you have an existing dbs_data from before, the above credentials MUST
-    # match what was used when the database was first initialized.
-    # To reset completely: stop containers, delete ./dbs_data folder, then restart.
     command: >
       --bind-address=0.0.0.0
       --character-set-server=utf8mb4
@@ -22,28 +40,34 @@ services:
     networks:
       - audioauto_net
 
+  # ── Audio-Auto Web App ───────────────────────────────────────────────────────
   web:
     build: .
     restart: always
     ports:
-      - "9876:8000"
-      - "8927:8927"
+      - "9876:8000"             # Web UI port (Sendspin port 8927 removed)
     environment:
+      # Database
       - DB_USER=audioauto
       - DB_PASS=secure_db_password
       - DB_HOST=db
       - DB_NAME=audioauto
-      - MQTT_BROKER=192.168.88.8
-      - MQTT_PORT=1883
-      - MQTT_USER=inskal
-      - MQTT_PASS=admin_inskal_mqtt
-      # Web UI login credentials (first-run creates this admin user in DB)
+      # Admin credentials (first-run only)
       - ADMIN_USER=admin
       - ADMIN_PASS=admin123
       - TZ=Asia/Jayapura
+      # ── Music Assistant ──────────────────────────────────────────────────
+      # MA uses host networking so the web-app reaches it via the host's LAN IP
+      - MA_URL=http://192.168.88.8:8095
+      - MA_TOKEN=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIzVzZtNXEzVklUUkpFMHdpMjVySFFnZzRHN01fRGZ3M3ZUemYyRVlnTGl3IiwianRpIjoiNzY4ZXFqSTJoSUpsZDF0ZlB3RThLalAyLUlDakRHNWFZSVJkaEkwMmZjUSIsImlhdCI6MTc4MTA3Mjk2NSwiZXhwIjoyMDk2NDMyOTY1LCJ1c2VybmFtZSI6Imdneml0aGEiLCJyb2xlIjoiYWRtaW4iLCJ0b2tlbl9uYW1lIjoiQXBwX0F1ZGlvX2F1dG8iLCJpc19sb25nX2xpdmVkIjp0cnVlfQ.xs1ayZnQSe8dAfY3ZxnMnlbAxaRm-lv3dla7txL_KY8
+      # Name of the group player in MA (display name, case-insensitive match)
+      - MA_GROUP_PLAYER=ESP32-Sync
+      # Base URL MA uses to fetch uploaded audio files from this web-app
+      # MA container is on host network, so it reaches the web-app via host LAN IP
+      - MA_MEDIA_URL_BASE=http://192.168.88.8:9876
     volumes:
       - ./app:/app/app
-      - ./audio_files:/app/audio_files
+      - /mnt/Main_Storage/Docker_NFS/Docker_VE/501_Music_Asist/media:/app/audio_files
     depends_on:
       - db
     networks:

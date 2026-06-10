@@ -51,11 +51,11 @@
                     <input type="range" id="volSlider" min="0" max="100" value="50" class="w-full h-1.5 bg-gray-300 rounded-lg appearance-none cursor-pointer dark:bg-gray-600 accent-primary">
                 </div>
                 <div class="flex items-center space-x-3 w-full text-sm text-gray-600 dark:text-gray-400">
-                    <i class="fas fa-file-audio text-gray-500 dark:text-gray-400 text-lg w-5 text-center"></i>
-                    <select id="codecSelect" onchange="updateGlobalCodec()" class="w-full bg-gray-200 dark:bg-gray-700 border-none rounded-lg px-2 py-1 focus:ring-1 focus:ring-primary outline-none">
-                        <option value="pcm">Raw PCM (LAN)</option>
-                        <option value="flac">FLAC (Lossless)</option>
-                        <option value="opus">OPUS (Voice/Low Bitrate)</option>
+                    <i class="fas fa-music text-gray-500 dark:text-gray-400 text-lg w-5 text-center"></i>
+                    <select id="queueModeSelect" onchange="setMAQueueMode(this.value)" class="w-full bg-gray-200 dark:bg-gray-700 border-none rounded-lg px-2 py-1 focus:ring-1 focus:ring-primary outline-none">
+                        <option value="off">No Repeat</option>
+                        <option value="one">Repeat One</option>
+                        <option value="all">Repeat All</option>
                     </select>
                 </div>
             </div>
@@ -83,21 +83,38 @@
         <div class="divide-y divide-gray-100 dark:divide-gray-800 custom-scrollbar max-h-80 overflow-y-auto" id="playlistContainer">
             <div class="p-8 text-center text-gray-500">Loading files...</div>
         </div>
-    <!-- Live Timing & Sync Graph -->
+    </div>
+
+    <!-- MA Player Status Panel -->
     <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6">
-        <!-- Live Timing Viz -->
+        <!-- ESP32-Sync Group Status -->
         <div class="bg-white dark:bg-[#1e293b] rounded-2xl shadow-xl p-6">
-            <h3 class="font-semibold text-gray-700 dark:text-gray-300 mb-4 border-b border-gray-200 dark:border-gray-800 pb-2"><i class="fas fa-stopwatch mr-2 text-primary"></i>Live Timing</h3>
-            <div class="timing-viz flex flex-col gap-3" id="timingVizContainer">
-                <div class="text-sm text-gray-500 text-center py-4">Waiting for device data...</div>
+            <h3 class="font-semibold text-gray-700 dark:text-gray-300 mb-4 border-b border-gray-200 dark:border-gray-800 pb-2">
+                <i class="fas fa-broadcast-tower mr-2 text-primary"></i>ESP32-Sync Players
+            </h3>
+            <div id="maStatusPanel" class="space-y-2">
+                <div class="text-sm text-gray-500 text-center py-4">Connecting to Music Assistant…</div>
             </div>
         </div>
-        
-        <!-- Synchronization Graph -->
+
+        <!-- MA Connection Info -->
         <div class="bg-white dark:bg-[#1e293b] rounded-2xl shadow-xl p-6">
-            <h3 class="font-semibold text-gray-700 dark:text-gray-300 mb-4 border-b border-gray-200 dark:border-gray-800 pb-2"><i class="fas fa-chart-line mr-2 text-primary"></i>Sync Offset History</h3>
-            <div class="w-full h-48 relative">
-                <canvas id="sendspin-demo-sync-graph"></canvas>
+            <h3 class="font-semibold text-gray-700 dark:text-gray-300 mb-4 border-b border-gray-200 dark:border-gray-800 pb-2">
+                <i class="fas fa-info-circle mr-2 text-primary"></i>Session Info
+            </h3>
+            <div class="space-y-3 text-sm">
+                <div class="flex justify-between">
+                    <span class="text-gray-500">Player</span>
+                    <span id="infoSelectedPlayer" class="font-mono text-primary font-semibold text-xs">—</span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-gray-500">MA URL</span>
+                    <span class="font-mono text-gray-600 dark:text-gray-400 text-xs">192.168.88.8:8095</span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-gray-500">WS Status</span>
+                    <span id="infoWsStatus" class="text-xs font-semibold text-gray-400">Connecting…</span>
+                </div>
             </div>
         </div>
     </div>

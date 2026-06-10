@@ -25,9 +25,11 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
     <script src='https://cdn.jsdelivr.net/npm/fullcalendar@6.1.11/index.global.min.js'></script>
+    <script src="https://cdn.jsdelivr.net/npm/rrule@2.7.2/dist/es5/rrule.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@fullcalendar/rrule@6.1.11/index.global.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://unpkg.com/wavesurfer.js@7/dist/wavesurfer.min.js"></script>
-    <script src="/static/sendspin-bundle.js"></script>
+    <!-- Music Assistant client (no Sendspin bundle needed) -->
     <style>
         /* Scrollbar */
         ::-webkit-scrollbar {
@@ -107,86 +109,6 @@
             }
         }
 
-        /* Audio Join Overlay */
-        #audioJoinOverlay {
-            position: fixed;
-            inset: 0;
-            z-index: 9999;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: rgba(15, 23, 42, 0.6);
-            backdrop-filter: blur(12px) saturate(120%);
-            -webkit-backdrop-filter: blur(12px) saturate(120%);
-            transition: opacity 0.4s ease, visibility 0.4s ease;
-        }
-
-        #audioJoinOverlay.hidden {
-            opacity: 0;
-            visibility: hidden;
-            pointer-events: none;
-        }
-
-        .join-audio-card {
-            background: rgba(255, 255, 255, 0.08);
-            backdrop-filter: blur(24px) saturate(180%);
-            -webkit-backdrop-filter: blur(24px) saturate(180%);
-            border: 1px solid rgba(255, 255, 255, 0.15);
-            border-radius: 24px;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3),
-                        inset 0 1px 0 rgba(255, 255, 255, 0.1);
-            padding: 3rem 2.5rem;
-            text-align: center;
-            max-width: 380px;
-            width: 90%;
-            animation: joinCardFloat 3s ease-in-out infinite;
-        }
-
-        @keyframes joinCardFloat {
-            0%, 100% { transform: translateY(0); }
-            50% { transform: translateY(-6px); }
-        }
-
-        .join-audio-btn {
-            background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
-            border: none;
-            border-radius: 16px;
-            padding: 16px 48px;
-            color: white;
-            font-size: 1.1rem;
-            font-weight: 700;
-            cursor: pointer;
-            transition: all 0.3s cubic-bezier(.4,0,.2,1);
-            box-shadow: 0 4px 20px rgba(59, 130, 246, 0.4);
-            position: relative;
-            overflow: hidden;
-        }
-
-        .join-audio-btn:hover {
-            transform: scale(1.05);
-            box-shadow: 0 6px 28px rgba(59, 130, 246, 0.6);
-        }
-
-        .join-audio-btn:active {
-            transform: scale(0.98);
-        }
-
-        .join-audio-pulse {
-            width: 80px;
-            height: 80px;
-            border-radius: 50%;
-            background: linear-gradient(135deg, rgba(59,130,246,0.3), rgba(139,92,246,0.3));
-            animation: joinPulse 2s ease-in-out infinite;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin: 0 auto 1.5rem;
-        }
-
-        @keyframes joinPulse {
-            0%, 100% { transform: scale(1); opacity: 0.8; }
-            50% { transform: scale(1.15); opacity: 1; }
-        }
 
         /* Sidebar: hidden on mobile by default, drawer when .mobile-open */
         #sidebar {
@@ -379,22 +301,7 @@
         </div>
 
         {% if request.session.get('user_id') %}
-        <!-- Audio Join Overlay — shown when AudioContext is suspended during active playback -->
-        <div id="audioJoinOverlay" class="hidden">
-            <div class="join-audio-card">
-                <div class="join-audio-pulse">
-                    <i class="fas fa-headphones text-3xl text-blue-400"></i>
-                </div>
-                <h2 class="text-2xl font-bold text-white mb-2">Audio is Playing</h2>
-                <p class="text-gray-300 text-sm mb-6">Tap below to join the synchronized audio stream</p>
-                <button id="audioJoinBtn" class="join-audio-btn">
-                    <i class="fas fa-play mr-2"></i>Join Audio
-                </button>
-                <p class="text-gray-500 text-xs mt-4">Required by browser autoplay policy</p>
-            </div>
-        </div>
-
-        <!-- Persistent Bottom Mini Player -->
+        <!-- Persistent Bottom Mini Player (MA-controlled, no browser audio) -->
         <div id="bottom-player"
             class="glass border-t border-gray-200 dark:border-gray-800 shadow-[0_-8px_32px_rgba(0,0,0,0.4)] flex items-center px-3 md:px-5 justify-between text-sm hidden">
             <div class="flex items-center w-2/5 md:w-1/4 min-w-0">
