@@ -4,7 +4,7 @@ import shutil
 import time
 import unicodedata
 from urllib.parse import quote
-from datetime import datetime
+from datetime import datetime, timedelta
 try:
     from zoneinfo import ZoneInfo          # Python 3.9+
 except ImportError:
@@ -150,7 +150,33 @@ async def _ma_event_handler(event_type: str, data) -> None:
 
 
 # ─── Scheduler ────────────────────────────────────────────────────────────────
-scheduler = BackgroundScheduler(timezone=os.environ.get("TZ", "Asia/Jayapura"))
+scheduler = BackgroundScheduler(
+    timezone=os.environ.get("TZ", "Asia/Jayapura"),
+    misfire_grace_time=1  # Reject jobs that fire more than 1 second late
+)
+
+
+def stop_scheduled_playback(schedule_id: int, player_id: str):
+    """Stop playback after scheduled song ends. Called automatically after song duration."""
+    print(f"[Schedule] Auto-stopping playback for schedule {schedule_id} on player {player_id}")
+    try:
+        # Import asyncio here to avoid circular import issues
+        import asyncio as _asyncio
+        async def _stop():
+            try:
+                await ma_client.stop(player_id)
+                print(f"[Schedule] Stop command sent for schedule {schedule_id}")
+            except Exception as e:
+                print(f"[Schedule] Stop command failed: {e}")
+        _asyncio.run(_stop())
+    except Exception as e:
+        print(f"[Schedule] Auto-stop error: {e}")
+    
+    # Remove the stop job after execution
+    try:
+        scheduler.remove_job(f"stop_sched_{schedule_id}")
+    except Exception:
+        pass
 
 
 def execute_schedule(schedule_id: int):
@@ -161,6 +187,9 @@ def execute_schedule(schedule_id: int):
         if not schedule or not schedule.is_active or not schedule.audio:
             print(f"[Schedule] Schedule {schedule_id} skipped: inactive or no audio")
             return
+
+        # Check if this is a one-time schedule (repeat == 'none')
+        is_one_time = schedule.repeat == 'none'
 
         # Resolve player_id - use device_name directly if it's a valid MA player_id
         raw_player = schedule.device_name
@@ -178,6 +207,7 @@ def execute_schedule(schedule_id: int):
         uri = audio_url(schedule.audio.filename)
         volume = schedule.volume
         track_name = schedule.audio.original_name
+        duration_sec = schedule.audio.duration_sec or 0  # Get song duration from database
 
         global main_loop
         if main_loop and main_loop.is_running():
@@ -201,6 +231,35 @@ def execute_schedule(schedule_id: int):
                 _asyncio.run(_execute_schedule_async(schedule_id, player_id, uri, volume, track_name))
             except Exception as e:
                 print(f"[Schedule] Direct execution error: {e}")
+
+        # Schedule auto-stop after song duration ends
+        # This ensures music stops even if song loops or doesn't finish naturally
+        if duration_sec > 0:
+            stop_time = datetime.now(ZoneInfo(_TZ_NAME)) + timedelta(seconds=duration_sec)
+            scheduler.add_job(
+                stop_scheduled_playback,
+                trigger=DateTrigger(run_date=stop_time),
+                args=[schedule_id, player_id],
+                id=f"stop_sched_{schedule_id}",
+                replace_existing=True,
+            )
+            print(f"[Schedule] Auto-stop scheduled at {stop_time.strftime('%H:%M:%S')} (duration: {duration_sec}s)")
+        else:
+            print(f"[Schedule] Warning: No duration info for {track_name}, auto-stop disabled")
+
+        # For one-time schedules, mark as inactive after execution
+        # This prevents the schedule from being re-added on app restart
+        if is_one_time:
+            schedule.is_active = False
+            db.commit()
+            print(f"[Schedule] One-time schedule {schedule_id} marked as inactive (played once)")
+            
+            # Also remove the play job from the scheduler to be safe
+            try:
+                scheduler.remove_job(f"sched_{schedule_id}")
+            except Exception:
+                pass  # Job might already be removed by APScheduler
+
     finally:
         db.close()
 
@@ -454,10 +513,25 @@ async def upload_file(
     db: Session = Depends(database.get_db),
     user=Depends(require_auth),
 ):
-    allowed_extensions = ["mp3", "wav", "flac", "aac", "ogg"]
+    # Stream-ready formats (accepted without transcode)
+    stream_ready = ["mp3", "wav", "flac", "aac", "ogg"]
+    # All formats accepted when transcode is enabled (ffmpeg handles conversion)
+    all_formats = stream_ready + [
+        "mp4", "m4a", "mkv", "webm", "avi", "mov", "wma", "opus",
+        "mpeg", "mpg", "ts", "mka", "3gp", "amr", "ape", "dts", "ac3",
+    ]
+    conf = db.query(models.SystemConfig).first()
+    transcode_on = conf and conf.transcode_enabled
+    allowed_extensions = all_formats if transcode_on else stream_ready
     ext = file.filename.rsplit(".", 1)[-1].lower() if '.' in file.filename else ''
     if ext not in allowed_extensions:
-        raise HTTPException(status_code=400, detail="Invalid file type")
+        detail = (
+            f"Unsupported format '.{ext}'. Accepted: {', '.join(stream_ready)}. "
+            "Enable Transcode in Config to upload any audio/video format."
+            if not transcode_on
+            else f"Unsupported format '.{ext}'."
+        )
+        raise HTTPException(status_code=400, detail=detail)
 
     safe_name = sanitize_filename(file.filename)
     filename  = f"{int(time.time())}_{safe_name}"
